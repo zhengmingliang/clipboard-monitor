@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>剪贴板监控</title>
+<style>
+  :root {
+    --bg: #101418;
+    --panel: #181e25;
+    --panel-2: #202833;
+    --line: #313b48;
+    --text: #e7edf4;
+    --muted: #8b98a8;
+    --read: #3dd68c;
+    --write: #e6b450;
+    --danger: #f07178;
+    --accent: #7eb6ff;
+    --shadow: 0 16px 40px rgba(0,0,0,.28);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Micro Hei", "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: flex-end;
+    padding: 18px 22px 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: .02em; }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .status-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .pill {
+    border: 1px solid var(--line);
+    background: var(--panel);
+    border-radius: 999px;
+    padding: 4px 10px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .pill.on { color: var(--read); border-color: #245c40; }
+  .pill.off { color: var(--danger); border-color: #6a3034; }
+  button, .btn {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 7px 12px;
+    cursor: pointer;
+    font: inherit;
+  }
+  button.primary { background: #1f6feb; border-color: #1f6feb; }
+  button.danger { background: #7d2b31; border-color: #7d2b31; }
+  button:disabled { opacity: .55; cursor: default; }
+  nav { display: flex; gap: 6px; padding: 10px 22px 0; }
+  nav button { background: transparent; }
+  nav button.active { background: var(--panel); color: var(--accent); border-color: var(--line); }
+  main { padding: 14px 22px 28px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 12px;
+    box-shadow: var(--shadow);
+  }
+  .filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  input, select, textarea {
+    background: #0f141a;
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 7px 8px;
+    font: inherit;
+  }
+  textarea { width: 100%; min-height: 140px; resize: vertical; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 7px; border-bottom: 1px solid var(--line); vertical-align: top; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 550; position: sticky; top: 0; background: var(--panel); }
+  tr { cursor: pointer; }
+  tr:hover { background: rgba(255,255,255,.03); }
+  tr.selected { background: rgba(126,182,255,.08); }
+  .badge { display: inline-block; min-width: 36px; text-align: center; border-radius: 999px; padding: 1px 7px; font-size: 12px; }
+  .badge.read { color: #07331d; background: var(--read); }
+  .badge.write { color: #3a2a08; background: var(--write); }
+  .summary { max-width: 420px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 400px); gap: 12px; align-items: start; }
+  .detail {
+    font-size: 13px;
+    min-width: 0;
+    max-height: calc(100vh - 210px);
+    overflow: auto;
+  }
+  .detail h2 { margin: 0 0 8px; font-size: 15px; }
+  .kv { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 6px 8px; margin-bottom: 10px; }
+  .kv span { color: var(--muted); }
+  .detail h2, .kv div, .file-path, .hash, .hop, .target, pre {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .targets { display: flex; flex-wrap: wrap; gap: 4px; }
+  .target {
+    background: #0f141a;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 1px 6px;
+    font-size: 12px;
+  }
+  .files { margin: 0 0 10px; padding-left: 18px; }
+  .files li { margin: 0 0 8px; }
+  .file-path { color: var(--muted); font-size: 12px; }
+  .hash { font-family: ui-monospace, monospace; font-size: 12px; }
+  .flow { margin: 0 0 12px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+  .flow h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight: 550; }
+  .chain { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .hop {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: #0f141a;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 6px 8px;
+  }
+  .hop.write { border-left: 3px solid var(--write); }
+  .hop.read { border-left: 3px solid var(--read); }
+  .hop.here { border-color: var(--accent); }
+  .hop .when { color: var(--muted); font-size: 12px; }
+  pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: #0f141a;
+    border-radius: 8px;
+    padding: 10px;
+    max-height: 320px;
+    overflow: auto;
+    margin: 0;
+  }
+  .pager { display: flex; gap: 8px; align-items: center; margin-top: 10px; color: var(--muted); }
+  .hidden { display: none; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  label.field { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; }
+  .note { color: var(--muted); font-size: 12px; }
+  .err { color: var(--danger); }
+  @media (max-width: 980px) {
+    .layout, .grid-2 { grid-template-columns: 1fr; }
+    header { flex-direction: column; align-items: flex-start; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>剪贴板监控</h1>
+    <div class="sub" id="meta">正在连接…</div>
+  </div>
+  <div class="status-row">
+    <span class="pill" id="pill">未知</span>
+    <span class="pill" id="dbpill"></span>
+    <button id="toggle" class="primary">停止监控</button>
+  </div>
+</header>
+<nav>
+  <button data-tab="logs" class="active">日志</button>
+  <button data-tab="rules">白名单</button>
+  <button data-tab="clean">清理</button>
+  <button data-tab="settings">设置</button>
+  <button data-tab="help">说明</button>
+</nav>
+<main>
+  <section id="tab-logs">
+    <div class="filters">
+      <input id="f-app" list="apps" placeholder="应用名">
+      <datalist id="apps"></datalist>
+      <select id="f-op">
+        <option value="">全部操作</option>
+        <option value="write">写入</option>
+        <option value="read">读取</option>
+      </select>
+      <select id="f-type">
+        <option value="">全部类型</option>
+        <option value="text">纯文本</option>
+        <option value="richtext">富文本</option>
+        <option value="image">图片</option>
+        <option value="files">文件</option>
+        <option value="custom">自定义</option>
+        <option value="mixed">混合</option>
+        <option value="empty">空</option>
+      </select>
+      <select id="f-sel">
+        <option value="">全部选择区</option>
+        <option value="CLIPBOARD">剪贴板</option>
+        <option value="PRIMARY">主选择</option>
+      </select>
+      <input id="f-from" type="datetime-local">
+      <input id="f-to" type="datetime-local">
+      <input id="f-q" placeholder="搜索摘要或正文" style="min-width:180px">
+      <button id="search">查询</button>
+      <label class="note"><input id="live" type="checkbox" checked> 实时刷新</label>
+    </div>
+    <div class="layout">
+      <div class="panel" style="overflow:auto; max-height: calc(100vh - 220px);">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th><th>操作</th><th>应用</th><th>来源</th><th>类型</th><th>大小</th><th>摘要</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div class="pager">
+          <button id="prev">上一页</button>
+          <span id="pageinfo"></span>
+          <button id="next">下一页</button>
+        </div>
+      </div>
+      <aside class="panel detail" id="detail">
+        <h2>详情</h2>
+        <p class="note">点一条日志查看内容、来源和格式。</p>
+      </aside>
+    </div>
+  </section>
+
+  <section id="tab-rules" class="hidden">
+    <div class="panel">
+      <p>每行一条。可以写进程名、可执行文件名或 WM_CLASS，也可以写进程号。多个程序都叫 python3 时，用 <code>pid:进程号</code> 或单独一行数字，只排除这一个进程。进程重启后 PID 会变，需要重新填。监控进程自身始终排除。</p>
+      <textarea id="whitelist" placeholder="例如&#10;keepassxc&#10;pid:4242&#10;9001"></textarea>
+      <p><button id="save-white" class="primary">保存白名单</button> <span id="white-msg" class="note"></span></p>
+    </div>
+  </section>
+
+  <section id="tab-clean" class="hidden">
+    <div class="panel">
+      <p>按时间范围和内容类型删除日志。至少要填一个条件。先预览再删除。</p>
+      <div class="grid-2">
+        <label class="field">开始<input id="c-from" type="datetime-local"></label>
+        <label class="field">结束<input id="c-to" type="datetime-local"></label>
+        <label class="field">内容类型
+          <select id="c-type">
+            <option value="">不限</option>
+            <option value="text">纯文本</option>
+            <option value="richtext">富文本</option>
+            <option value="image">图片</option>
+            <option value="files">文件</option>
+            <option value="custom">自定义</option>
+            <option value="mixed">混合</option>
+            <option value="empty">空</option>
+          </select>
+        </label>
+        <label class="field">操作
+          <select id="c-op">
+            <option value="">不限</option>
+            <option value="write">写入</option>
+            <option value="read">读取</option>
+          </select>
+        </label>
+      </div>
+      <p>
+        <button id="c-preview">预览数量</button>
+        <button id="c-run" class="danger">执行清理</button>
+        <span id="c-msg" class="note"></span>
+      </p>
+    </div>
+  </section>
+
+  <section id="tab-settings" class="hidden">
+    <div class="panel">
+      <div class="grid-2">
+        <label class="field">保留天数<input id="s-days" type="number" min="1" max="3650"></label>
+        <label class="field">数据库上限 MB<input id="s-mb" type="number" min="32" max="102400"></label>
+        <label class="field">文本完整保存上限（字节）<input id="s-text" type="number" min="4096"></label>
+        <label class="field">截断后保留前缀（字节）<input id="s-preview" type="number" min="256"></label>
+        <label class="field">单文件内容上限（字节）<input id="s-file" type="number" min="0"></label>
+        <label class="field">监听地址（修改后需重启进程）<input id="s-listen"></label>
+      </div>
+      <p>
+        <label><input id="s-file-on" type="checkbox"> 保存小于上限的单个普通文件内容</label><br>
+        <label><input id="s-primary" type="checkbox"> 同时监控主选择区 PRIMARY</label>
+      </p>
+      <p><button id="save-settings" class="primary">保存设置</button> <span id="s-msg" class="note"></span></p>
+    </div>
+  </section>
+
+  <section id="tab-help" class="hidden">
+    <div class="panel">
+      <h2>这是什么</h2>
+      <p>它在本机 X11 上记录哪个程序写入了剪贴板、哪个程序又读走了它。日志留在本地 SQLite，不上传。</p>
+      <h2>记录规则</h2>
+      <ul>
+        <li>纯文本、富文本：小于 1MB（可改）保存原文，达到上限只留大小和开头一段。</li>
+        <li>文件列表：保存数量、名称和路径。只有勾选“保存单个小文件内容”且文件小于 2MB 时才读文件内容。</li>
+        <li>图片和其它二进制：只保存格式、尺寸和大小，不保存像素。</li>
+      <li>打开一条写入，流转里列出之后读过这份内容的进程。点其中一条会打开对应记录。</li>
+      </ul>
+      <h2>怎么停</h2>
+      <p>页面上的开关只暂停记录，进程还在。命令行 <code>clipboard-monitor stop</code> 会退出进程。</p>
+      <h2>限制</h2>
+      <p>读取监控依赖 X 服务器的 RECORD 扩展，写入监控依赖 XFixes。Wayland 原生剪贴板不在这个程序的能力范围内。同一次粘贴里连续请求多种格式会合并成一条读取。</p>
+    </div>
+  </section>
+</main>
+<script>
+const state = { page: 0, pageSize: 50, total: 0, selected: null, timer: null, settings: null };
+
+const typeName = {
+  text: "纯文本", richtext: "富文本", image: "图片", files: "文件",
+  custom: "自定义", mixed: "混合", empty: "空"
+};
+const selName = { CLIPBOARD: "剪贴板", PRIMARY: "主选择" };
+
+function $(id) { return document.getElementById(id); }
+async function api(path, opt) {
+  const res = await fetch(path, opt);
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!res.ok) throw new Error((data && data.error) || res.statusText);
+  return data;
+}
+function fmtTime(ms) {
+  if (!ms) return "";
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function human(n) {
+  n = Number(n) || 0;
+  const u = ["B", "KB", "MB", "GB"];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return i === 0 ? `${n} B` : `${v.toFixed(1)} ${u[i]}`;
+}
+function localInputToMs(value) {
+  if (!value) return "";
+  const t = new Date(value).getTime();
+  return Number.isFinite(t) ? String(t) : "";
+}
+function exeBase(path) {
+  if (!path) return "";
+  const parts = String(path).split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "";
+}
+function displayApp(app, exec) {
+  const name = app || "";
+  const base = exeBase(exec);
+  if (!base || base === name) return name || base;
+  // /proc/pid/comm 最长 15 字节，可执行文件名更长时用文件名。
+  if (name && base.startsWith(name) && base.length > name.length) return base;
+  return name || base;
+}
+function targetChips(raw) {
+  const parts = String(raw || "").split(",").map(s => s.trim()).filter(Boolean);
+  if (!parts.length) return `<span class="note">无</span>`;
+  return `<div class="targets">${parts.map(t => `<span class="target">${escapeHtml(t)}</span>`).join("")}</div>`;
+}
+function readerNames(reads) {
+  const seen = new Set();
+  const out = [];
+  for (const r of reads) {
+    const name = displayApp(r.app_name, r.exec_path) || "未知进程";
+    const key = r.pid ? `pid:${r.pid}` : name;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r.pid ? `${name} (${r.pid})` : name);
+  }
+  return out;
+}
+function hopButton(hop, currentId) {
+  const name = displayApp(hop.app_name, hop.exec_path) || "未知进程";
+  const kind = hop.op === "read" ? "读取" : "写入";
+  const here = hop.id === currentId ? " here" : "";
+  const pid = hop.pid ? ` · pid ${hop.pid}` : "";
+  return `<button type="button" class="hop ${hop.op}${here}" data-flow="${hop.id}">
+    <div><span class="badge ${hop.op}">${kind}</span> ${escapeHtml(name)}${pid}</div>
+    <div class="when">${fmtTime(hop.ts_ms)}</div>
+  </button>`;
+}
+function renderFlow(flow, currentId) {
+  if (!flow) return "";
+  const reads = flow.reads || [];
+  const names = readerNames(reads);
+  let body = "";
+  if (flow.write) {
+    body += hopButton(flow.write, currentId);
+  } else {
+    body += `<p class="note">没有对应的写入记录。</p>`;
+  }
+  if (!reads.length) {
+    body += `<p class="note">还没有进程读取这次写入。</p>`;
+  } else {
+    const limited = flow.reads_limited ? "，只列出前 200 次" : "";
+    body += `<p class="note">${names.length} 个进程读取，共 ${reads.length} 次${limited}：${escapeHtml(names.join("、"))}</p>`;
+    body += `<ol class="chain">${reads.map(r => `<li>${hopButton(r, currentId)}</li>`).join("")}</ol>`;
+  }
+  return `<section class="flow"><h3>流转</h3>${body}</section>`;
+}
+
+async function refreshStatus() {
+  const s = await api("/api/status");
+  const on = s.enabled && s.xfixes;
+  $("pill").textContent = s.enabled ? (s.xfixes ? "监控中" : "已开启，X11 未就绪") : "已暂停";
+  $("pill").className = "pill " + (s.enabled ? "on" : "off");
+  $("toggle").textContent = s.enabled ? "停止监控" : "开始监控";
+  const db = s.db || {};
+  $("dbpill").textContent = `${db.db_human || ""} / ${s.max_db_human || ""}`;
+  const err = s.last_error ? ` · ${s.last_error}` : "";
+  $("meta").textContent =
+    `X11 ${s.display || "?"} · 写入 ${s.writes_seen} · 读取 ${s.reads_seen} · 近 24 小时写 ${db.writes_24h || 0} / 读 ${db.reads_24h || 0} · 保留 ${s.retention_days} 天${on ? "" : ""}${err}`;
+}
+
+async function loadApps() {
+  const data = await api("/api/apps");
+  $("apps").innerHTML = (data.apps || []).map(a => `<option value="${escapeHtml(a)}"></option>`).join("");
+}
+
+function filters() {
+  const p = new URLSearchParams();
+  const put = (k, v) => { if (v) p.set(k, v); };
+  put("app", $("f-app").value.trim());
+  put("op", $("f-op").value);
+  put("type", $("f-type").value);
+  put("selection", $("f-sel").value);
+  put("from", localInputToMs($("f-from").value));
+  put("to", localInputToMs($("f-to").value));
+  put("q", $("f-q").value.trim());
+  p.set("limit", state.pageSize);
+  p.set("offset", state.page * state.pageSize);
+  return p;
+}
+
+async function loadEvents() {
+  const data = await api("/api/events?" + filters().toString());
+  state.total = data.total || 0;
+  const body = $("rows");
+  body.innerHTML = "";
+  for (const ev of data.events || []) {
+    const tr = document.createElement("tr");
+    if (ev.id === state.selected) tr.className = "selected";
+    tr.innerHTML = `
+      <td>${fmtTime(ev.ts_ms)}</td>
+      <td><span class="badge ${ev.op}">${ev.op === "read" ? "读取" : "写入"}</span></td>
+      <td>${escapeHtml(displayApp(ev.app_name, ev.exec_path))}${ev.pid ? " · " + ev.pid : ""}</td>
+      <td>${escapeHtml(ev.source_app || "")}</td>
+      <td>${typeName[ev.content_type] || escapeHtml(ev.content_type || "")}</td>
+      <td>${human(ev.content_size)}</td>
+      <td class="summary" title="${escapeHtml(ev.summary || "")}">${escapeHtml(ev.summary || "")}</td>`;
+    tr.onclick = () => showDetail(ev.id, tr);
+    body.appendChild(tr);
+  }
+  const pages = Math.max(1, Math.ceil(state.total / state.pageSize));
+  $("pageinfo").textContent = `第 ${state.page + 1} / ${pages} 页 · ${state.total} 条`;
+  $("prev").disabled = state.page <= 0;
+  $("next").disabled = (state.page + 1) >= pages;
+}
+
+async function showDetail(id, tr) {
+  state.selected = id;
+  document.querySelectorAll("#rows tr").forEach(el => el.classList.remove("selected"));
+  if (tr) tr.classList.add("selected");
+  const ev = await api("/api/events/" + id);
+  const e = ev.event || ev;
+  let meta = {};
+  try { meta = ev.meta_json ? JSON.parse(ev.meta_json) : {}; } catch { meta = {}; }
+  let extra = "";
+  if (meta.files && meta.files.entries) {
+    extra += `<ul class="files">` + meta.files.entries.map(f =>
+      `<li><div>${escapeHtml(f.name || "未命名")}</div><div class="file-path">${escapeHtml(f.path || "")}</div></li>`).join("") + `</ul>`;
+  }
+  if (meta.image) {
+    const im = meta.image;
+    extra += `<p>图片 ${escapeHtml(im.mime || "未知格式")}，${im.width || "?"}×${im.height || "?"}，${human(im.size || 0)}。未保存像素。</p>`;
+  }
+  const app = displayApp(e.app_name, e.exec_path);
+  const commNote = e.app_name && app !== e.app_name ? ` <span class="note">进程名 ${escapeHtml(e.app_name)}</span>` : "";
+  const body = ev.body ? `<pre>${escapeHtml(ev.body)}</pre>` : `<p class="note">没有保存正文。</p>`;
+  const blob = ev.has_blob ? `<p><a href="/api/events/${e.id}/file">下载记录的文件内容</a></p>` : "";
+  $("detail").innerHTML = `
+    <h2>${e.op === "read" ? "读取" : "写入"} · ${escapeHtml(app || "未知进程")}</h2>
+    ${renderFlow(ev.flow, e.id)}
+    <div class="kv">
+      <span>时间</span><div>${fmtTime(e.ts_ms)}</div>
+      <span>选择区</span><div>${selName[e.selection] || escapeHtml(e.selection || "")}</div>
+      <span>进程</span><div>${escapeHtml(app || "")} ${e.pid ? "(pid " + e.pid + ")" : ""}${commNote}</div>
+      <span>路径</span><div>${escapeHtml(e.exec_path || "")}</div>
+      <span>窗口类</span><div>${escapeHtml(e.wm_class || "")}</div>
+      <span>来源</span><div>${escapeHtml(e.source_app || "")} ${e.source_pid ? "(pid " + e.source_pid + ")" : ""}</div>
+      <span>类型</span><div>${typeName[e.content_type] || escapeHtml(e.content_type || "")}${e.truncated ? " · 已截断" : ""}</div>
+      <span>大小</span><div>${human(e.content_size)}</div>
+      <span>格式</span><div>${targetChips(e.targets)}</div>
+      <span>原因</span><div>${escapeHtml(e.reason || "")}</div>
+      <span>校验</span><div class="hash">${escapeHtml(ev.sha256 || "")}</div>
+    </div>
+    ${extra}${body}${blob}
+    ${e.pid ? `<p><button type="button" id="add-pid">按 PID ${e.pid} 加入白名单</button></p>` : ""}`;
+  const add = $("add-pid");
+  if (add) {
+    add.onclick = () => addPidToWhitelist(e.pid).catch(err => {
+      add.insertAdjacentHTML("afterend", `<span class="note err"> ${escapeHtml(err.message)}</span>`);
+    });
+  }
+}
+
+async function addPidToWhitelist(pid) {
+  if (!state.settings) await loadSettings();
+  const line = "pid:" + pid;
+  const lines = $("whitelist").value.split(/\n/).map(s => s.trim()).filter(Boolean);
+  const exists = lines.some(s => s.toLowerCase() === line || s === String(pid));
+  if (!exists) {
+    lines.push(line);
+    $("whitelist").value = lines.join("\n");
+  }
+  await api("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(collectSettings())
+  });
+  state.settings.whitelist = lines;
+  $("white-msg").textContent = exists ? `PID ${pid} 已在白名单` : `已排除 PID ${pid}`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+async function loadSettings() {
+  const cfg = await api("/api/settings");
+  state.settings = cfg;
+  $("whitelist").value = (cfg.whitelist || []).join("\n");
+  $("s-days").value = cfg.retention_days;
+  $("s-mb").value = cfg.max_db_mb;
+  $("s-text").value = cfg.text_full_limit_bytes;
+  $("s-preview").value = cfg.text_preview_bytes;
+  $("s-file").value = cfg.file_content_limit_bytes;
+  $("s-listen").value = cfg.listen;
+  $("s-file-on").checked = !!cfg.record_file_content;
+  $("s-primary").checked = !!cfg.monitor_primary;
+}
+
+function collectSettings() {
+  const cfg = Object.assign({}, state.settings || {});
+  cfg.retention_days = Number($("s-days").value);
+  cfg.max_db_mb = Number($("s-mb").value);
+  cfg.text_full_limit_bytes = Number($("s-text").value);
+  cfg.text_preview_bytes = Number($("s-preview").value);
+  cfg.file_content_limit_bytes = Number($("s-file").value);
+  cfg.listen = $("s-listen").value.trim();
+  cfg.record_file_content = $("s-file-on").checked;
+  cfg.monitor_primary = $("s-primary").checked;
+  cfg.whitelist = $("whitelist").value.split(/\n/).map(s => s.trim()).filter(Boolean);
+  if (state.settings && typeof state.settings.enabled_on_start === "boolean") {
+    cfg.enabled_on_start = state.settings.enabled_on_start;
+  }
+  return cfg;
+}
+
+document.querySelectorAll("nav button").forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll("nav button").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    for (const id of ["logs", "rules", "clean", "settings", "help"]) {
+      $("tab-" + id).classList.toggle("hidden", btn.dataset.tab !== id);
+    }
+  };
+});
+
+$("toggle").onclick = async () => {
+  const status = await api("/api/status");
+  await api("/api/monitor", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: !status.enabled })
+  });
+  await refreshStatus();
+};
+$("detail").addEventListener("click", (e) => {
+  const hop = e.target.closest("[data-flow]");
+  if (!hop) return;
+  const id = Number(hop.dataset.flow);
+  if (!id || id === state.selected) return;
+  showDetail(id).catch(showErr);
+});
+$("search").onclick = () => { state.page = 0; loadEvents().catch(showErr); };
+$("prev").onclick = () => { if (state.page > 0) { state.page--; loadEvents(); } };
+$("next").onclick = () => { state.page++; loadEvents(); };
+$("save-white").onclick = async () => {
+  try {
+    if (!state.settings) await loadSettings();
+    const cfg = collectSettings();
+    await api("/api/settings", { method: "PUT", headers: {"Content-Type":"application/json"}, body: JSON.stringify(cfg) });
+    $("white-msg").textContent = "已保存";
+  } catch (e) { $("white-msg").textContent = e.message; }
+};
+$("save-settings").onclick = async () => {
+  try {
+    const cfg = collectSettings();
+    const res = await api("/api/settings", { method: "PUT", headers: {"Content-Type":"application/json"}, body: JSON.stringify(cfg) });
+    $("s-msg").textContent = res.listen_changed_ignored ? "已保存。监听地址要重启进程才生效，这次没有改端口。" : "已保存";
+    await loadSettings();
+    await refreshStatus();
+  } catch (e) { $("s-msg").textContent = e.message; }
+};
+
+function cleanupBody(dry) {
+  return {
+    from_ms: localInputToMs($("c-from").value) ? Number(localInputToMs($("c-from").value)) : null,
+    to_ms: localInputToMs($("c-to").value) ? Number(localInputToMs($("c-to").value)) : null,
+    content_type: $("c-type").value,
+    op: $("c-op").value,
+    dry_run: dry
+  };
+}
+$("c-preview").onclick = async () => {
+  try {
+    const res = await api("/api/cleanup", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(cleanupBody(true)) });
+    $("c-msg").textContent = `将删除 ${res.matched} 条`;
+  } catch (e) { $("c-msg").textContent = e.message; }
+};
+$("c-run").onclick = async () => {
+  const body = cleanupBody(false);
+  if (!confirm("删除这些日志？此操作不能撤销。")) return;
+  try {
+    const res = await api("/api/cleanup", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body) });
+    $("c-msg").textContent = `已删除 ${res.matched} 条`;
+    await refreshStatus();
+    await loadEvents();
+  } catch (e) { $("c-msg").textContent = e.message; }
+};
+
+function showErr(e) {
+  $("meta").textContent = e.message || String(e);
+  $("meta").className = "sub err";
+}
+
+function tick() {
+  refreshStatus().catch(showErr);
+  if ($("live").checked && !$("tab-logs").classList.contains("hidden")) {
+    loadEvents().catch(showErr);
+  }
+}
+loadSettings().catch(showErr);
+loadApps().catch(() => {});
+tick();
+state.timer = setInterval(tick, 2000);
+</script>
+</body>
+</html>
