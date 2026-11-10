@@ -4,6 +4,7 @@
 //! Windows/macOS 记录系统剪贴板的文本与图片变化。
 //! 内容按类型截断后写入 SQLite，界面由本机 HTTP 服务提供。
 
+pub mod autostart;
 pub mod classify;
 pub mod config;
 pub mod crypto;

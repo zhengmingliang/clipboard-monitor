@@ -37,11 +37,21 @@ fn real_main() -> Result<()> {
         return Ok(());
     }
     let cmd = match args.first().map(|s| s.as_str()) {
-        Some("serve") | Some("start") | Some("stop") | Some("status") | Some("cleanup") => {
-            args.remove(0)
-        }
+        Some("serve") | Some("start") | Some("stop") | Some("status") | Some("cleanup")
+        | Some("autostart") | Some("service") => args.remove(0),
         _ => "serve".to_string(),
     };
+    // autostart/service 有自己的子动作，不复用通用 parse_opts。
+    let action = if matches!(cmd.as_str(), "autostart" | "service") {
+        args.first()
+            .cloned()
+            .unwrap_or_else(|| "status".to_string())
+    } else {
+        String::new()
+    };
+    if matches!(cmd.as_str(), "autostart" | "service") && !args.is_empty() {
+        args.remove(0);
+    }
     let opt = parse_opts(&args)?;
     match cmd.as_str() {
         "serve" => serve(opt),
@@ -49,10 +59,95 @@ fn real_main() -> Result<()> {
         "stop" => stop_daemon(&opt),
         "status" => print_status(&opt),
         "cleanup" => cleanup_cli(&opt),
+        "autostart" => autostart_cli(&action),
+        "service" => service_cli(&action),
         _ => {
             print_help();
             Ok(())
         }
+    }
+}
+
+fn autostart_cli(action: &str) -> Result<()> {
+    match action {
+        "enable" => {
+            let s = clipboard_monitor::autostart::enable()?;
+            println!("已启用开机自启\n位置: {}\n命令: {}", s.location, s.command);
+        }
+        "disable" => {
+            let s = clipboard_monitor::autostart::disable()?;
+            println!("已禁用开机自启\n位置: {}", s.location);
+        }
+        "status" => {
+            let s = clipboard_monitor::autostart::status()?;
+            println!(
+                "开机自启: {}\n位置: {}\n命令: {}",
+                if s.enabled { "已启用" } else { "未启用" },
+                s.location,
+                s.command
+            );
+        }
+        other => bail!("autostart 只接受 enable|disable|status，收到 {other}"),
+    }
+    Ok(())
+}
+
+/// 输出可直接安装的 systemd user unit / launchd plist 内容（服务化）。
+/// 只打印到 stdout，不写系统目录，由用户自行 `systemctl --user enable`。
+fn service_cli(action: &str) -> Result<()> {
+    match action {
+        "unit" | "plist" => {}
+        other => bail!("service 只接受 unit|plist，收到 {other}"),
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let exe = std::env::current_exe().context("找不到自身可执行文件")?;
+    #[cfg(target_os = "linux")]
+    {
+        if action == "plist" {
+            bail!("Linux 请使用 service unit；plist 是 macOS 专用");
+        }
+        print!(
+            "[Unit]\n\
+             Description=Clipboard Monitor (user)\n\
+             After=graphical-session.target\n\n\
+             [Service]\n\
+             Type=simple\n\
+             ExecStart={exe} serve\n\
+             Restart=on-failure\n\
+             RestartSec=5\n\n\
+             [Install]\n\
+             WantedBy=default.target\n",
+            exe = exe.display()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if action == "unit" {
+            bail!("macOS 请使用 service plist；unit 是 Linux 专用");
+        }
+        print!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\"><dict>\n\
+               <key>Label</key><string>com.clipboard-monitor.service</string>\n\
+               <key>ProgramArguments</key><array><string>{exe}</string><string>serve</string></array>\n\
+               <key>RunAtLoad</key><true/>\n\
+               <key>KeepAlive</key><true/>\n\
+             </dict></plist>\n",
+            exe = exe.display()
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        bail!("Windows 请用 autostart enable（HKCU Run）；service 仅支持 Linux/macOS 单元输出")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        bail!("当前平台不支持服务化输出")
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        Ok(())
     }
 }
 
@@ -493,8 +588,13 @@ fn print_help() {
   clipboard-monitor stop [--data-dir 目录]
   clipboard-monitor status [--data-dir 目录]
   clipboard-monitor cleanup [--data-dir 目录] --from 时间 --to 时间 [--type 类型] [--op read|write]
+  clipboard-monitor autostart enable|disable|status
+  clipboard-monitor service unit|plist
 
 不带子命令时等价于 serve，在前台运行并打开本机界面。
+autostart 用三平台原生方式配置当前用户开机自启（Linux .desktop /
+macOS LaunchAgents plist / Windows HKCU Run），无需管理员权限。
+service 只打印 systemd user unit 或 launchd plist 内容，不写系统目录。
 默认界面 http://127.0.0.1:27890
 默认目录遵循 Windows/macOS/Linux 系统规范，详见 README。
 也可用 --data-dir 和 --config 显式指定。

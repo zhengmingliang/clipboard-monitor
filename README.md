@@ -69,6 +69,36 @@ SQLite 编进可执行文件，不需要单独安装数据库。Windows 发布�
 ./target/release/clipboard-monitor serve --listen 127.0.0.1:27890 --data-dir ./monitor-data
 ```
 
+### 开机自启与服务化
+
+`autostart` 用三平台原生方式配置**当前用户**的开机自启，不需要管理员权限，也不写系统目录：
+
+```bash
+./target/release/clipboard-monitor autostart enable    # 启用
+./target/release/clipboard-monitor autostart status    # 查看状态与配置位置
+./target/release/clipboard-monitor autostart disable   # 禁用（只删除本工具写入的那一项）
+```
+
+| 平台 | 配置位置 |
+| --- | --- |
+| Linux | `~/.config/autostart/clipboard-monitor.desktop`（XDG Autostart） |
+| macOS | `~/Library/LaunchAgents/com.clipboard-monitor.plist`（launchd） |
+| Windows | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\ClipboardMonitor` |
+
+`service` 只把可直接安装的单元内容打印到 stdout，**不写系统目录**，由用户自行决定如何安装：
+
+```bash
+# Linux (systemd --user)
+./target/release/clipboard-monitor service unit > ~/.config/systemd/user/clipboard-monitor.service
+systemctl --user daemon-reload && systemctl --user enable --now clipboard-monitor
+
+# macOS (launchd)
+./target/release/clipboard-monitor service plist > ~/Library/LaunchAgents/com.clipboard-monitor.service.plist
+launchctl load ~/Library/LaunchAgents/com.clipboard-monitor.service.plist
+```
+
+Windows 用 `autostart enable`（HKCU Run）即可；`service` 不提供 Windows 服务输出。启用 `autostart` 时若命令行带过 `--data-dir` / `--config`，会把这些参数写进自启命令，保证数据目录一致。
+
 监听地址建议保持为 `127.0.0.1`。如果绑定到其它地址，日志可能被同一网络里的机器访问。
 
 ## 配置与数据目录
