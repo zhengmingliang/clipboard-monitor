@@ -108,6 +108,22 @@ $env:CLIPBOARD_MONITOR_LOG = "debug"
 - **Linux**：需要 X11 会话以及 XFIXES/RECORD 扩展。可用 `echo "$XDG_SESSION_TYPE $DISPLAY"` 和 `xdpyinfo | grep -E 'RECORD|XFIXES'` 检查。RECORD 不可用只影响读取审计，XFixes 变化记录仍可运行。
 - **界面状态**：`GET /api/status` 中的 `changes_ready` 表示变化监听是否就绪，`capabilities` 列出当前后端能力，`last_error` 给出最近一次异常。
 
+## 常用任务
+
+安装 [just](https://just.systems/) 后运行 `just --list` 查看全部快捷任务：
+
+```bash
+just check                 # 格式、Clippy、单元测试
+just build                 # 构建 release 二进制
+just smoke                 # 构建并执行 --help
+just run "--listen 127.0.0.1:27891"
+just test-native           # 真实系统剪贴板文本/图片测试，会替换剪贴板
+just test-x11              # Linux/X11 完整读写流转测试
+just verify-release        # 下载并校验已发布的包及 SHA256SUMS
+```
+
+`start`、`status`、`stop` 也分别对应同名命令。`just` 在 Windows 使用 PowerShell，在其它平台使用 Bash；发布校验任务需要已登录的 GitHub CLI (`gh`)。
+
 ## 测试
 
 ```bash
