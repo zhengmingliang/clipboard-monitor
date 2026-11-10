@@ -163,6 +163,7 @@ fn start_daemon(opt: Opt) -> Result<()> {
     fs::create_dir_all(&opt.data_dir)?;
     restrict_dir(&opt.data_dir);
     let log_path = opt.data_dir.join("monitor.log");
+    rotate_log(&log_path, MAX_LOG_BYTES);
     let log_file = open_private(&log_path, true)?;
     let exe = std::env::current_exe().context("找不到自身可执行文件")?;
     let mut cmd = Command::new(exe);
@@ -294,6 +295,21 @@ fn cleanup_cli(opt: &Opt) -> Result<()> {
     let n = db.cleanup(&spec)?;
     println!("已删除 {n} 条");
     Ok(())
+}
+
+/// 后台日志超过该大小时轮转，避免长期挂机无限增长。
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+
+/// 日志达到上限时改名为 `.old`（覆盖上一档），随后新日志从空文件开始。
+fn rotate_log(log_path: &Path, max_bytes: u64) {
+    if let Ok(meta) = fs::metadata(log_path) {
+        if meta.len() >= max_bytes {
+            let old = log_path.with_extension("log.old");
+            if fs::rename(log_path, &old).is_ok() {
+                restrict_file(&old);
+            }
+        }
+    }
 }
 
 fn open_private(path: &Path, append: bool) -> Result<std::fs::File> {
@@ -489,4 +505,34 @@ fn print_help() {
 环境变量 CLIPBOARD_MONITOR_LOG=debug 会打印协议级调试信息，不打印剪贴板正文。
 "#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_log_is_rotated_and_small_log_is_kept() {
+        let dir = std::env::temp_dir().join(format!(
+            "clipmon-rotate-{}-{}",
+            std::process::id(),
+            clipboard_monitor::now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("monitor.log");
+        fs::write(&log_path, b"1234567890").unwrap();
+        rotate_log(&log_path, 8);
+        assert!(!log_path.exists(), "超限日志应被改名");
+        let old = log_path.with_extension("log.old");
+        assert_eq!(fs::read(&old).unwrap(), b"1234567890");
+
+        // 小文件不轮转；再次超限时覆盖上一档。
+        fs::write(&log_path, b"abc").unwrap();
+        rotate_log(&log_path, 8);
+        assert!(log_path.exists());
+        fs::write(&log_path, b"9876543210").unwrap();
+        rotate_log(&log_path, 8);
+        assert_eq!(fs::read(&old).unwrap(), b"9876543210", "新档应覆盖旧档");
+        let _ = fs::remove_dir_all(dir);
+    }
 }
