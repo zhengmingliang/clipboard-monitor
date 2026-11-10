@@ -366,6 +366,14 @@ fn dispatch(app: &App, method: &str, path: &str, query: &str, body: &[u8]) -> Re
         let (rows, total) = db.query_events(&filter, limit, offset)?;
         return Ok(json_ok(json!({"total": total, "events": rows})));
     }
+    if method == "GET" && path == "/api/analytics" {
+        let days = parse_query(query)
+            .get("days")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(14);
+        let db = app.db.lock().unwrap_or_else(|e| e.into_inner());
+        return Ok(json_ok(serde_json::to_value(db.analytics(days)?)?));
+    }
     if method == "GET" && path == "/api/apps" {
         let db = app.db.lock().unwrap_or_else(|e| e.into_inner());
         return Ok(json_ok(json!({"apps": db.distinct_apps()?})));

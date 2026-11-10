@@ -70,6 +70,20 @@
     box-shadow: var(--shadow);
   }
   .filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+  .stat-card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+  .stat-card h3 { margin: 0 0 10px; font-size: 14px; font-weight: 600; }
+  .bars { display: flex; align-items: flex-end; gap: 3px; height: 110px; }
+  .bars .bar { flex: 1; min-width: 4px; background: var(--accent); border-radius: 3px 3px 0 0; position: relative; }
+  .bars .bar.read { background: var(--read); }
+  .bars .bar:hover::after { content: attr(data-tip); position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
+    background: #000; color: #fff; padding: 3px 6px; border-radius: 4px; font-size: 11px; white-space: nowrap; z-index: 3; }
+  .rowlist { display: flex; flex-direction: column; gap: 6px; }
+  .rowlist .r { display: grid; grid-template-columns: minmax(60px, 1fr) 3fr auto; gap: 8px; align-items: center; font-size: 12px; }
+  .rowlist .track { background: #0f141a; border-radius: 4px; height: 10px; overflow: hidden; }
+  .rowlist .fill { height: 100%; background: var(--accent); }
+  .rowlist .n { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .stat-meta { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
   input, select, textarea {
     background: #0f141a;
     color: var(--text);
@@ -168,6 +182,7 @@
 <nav>
   <button data-tab="logs" class="active">日志</button>
   <button data-tab="rules">白名单</button>
+  <button data-tab="stats">统计</button>
   <button data-tab="clean">清理</button>
   <button data-tab="settings">设置</button>
   <button data-tab="help">说明</button>
@@ -231,6 +246,22 @@
       <p>每行一条。可以写进程名、可执行文件名或 WM_CLASS（Linux/X11），也可以写进程号。多个程序都叫 python3 时，用 <code>pid:进程号</code> 或单独一行数字，只排除这一个进程。进程重启后 PID 会变，需要重新填。监控进程自身始终排除。白名单在 Windows、macOS、Linux 上都生效：命中的程序内容不会写入数据库。</p>
       <textarea id="whitelist" placeholder="例如&#10;keepassxc&#10;pid:4242&#10;9001"></textarea>
       <p><button id="save-white" class="primary">保存白名单</button> <span id="white-msg" class="note"></span></p>
+    </div>
+  </section>
+
+  <section id="tab-stats" class="hidden">
+    <div class="stat-meta">
+      最近 <select id="stat-days" style="width:auto">
+        <option value="7">7 天</option><option value="14" selected>14 天</option>
+        <option value="30">30 天</option><option value="90">90 天</option>
+      </select> · 共 <strong id="stat-total">0</strong> 条事件
+      <button id="stat-refresh" type="button">刷新</button>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-card"><h3>每日写入 / 读取</h3><div class="bars" id="stat-daily"></div></div>
+      <div class="stat-card"><h3>24 小时分布</h3><div class="bars" id="stat-hours"></div></div>
+      <div class="stat-card"><h3>内容类型</h3><div class="rowlist" id="stat-types"></div></div>
+      <div class="stat-card"><h3>来源应用 Top 10</h3><div class="rowlist" id="stat-apps"></div></div>
     </div>
   </section>
 
@@ -459,6 +490,48 @@ async function loadApps() {
   $("apps").innerHTML = (data.apps || []).map(a => `<option value="${escapeHtml(a)}"></option>`).join("");
 }
 
+// ---- 统计与可视化（纯 DOM，无外部依赖） ----
+function renderBars(el, values, tips, readFlags) {
+  const max = Math.max(1, ...values);
+  el.innerHTML = values.map((v, i) => {
+    const h = Math.max(v > 0 ? 3 : 1, Math.round(v / max * 100));
+    const tip = tips && tips[i] ? tips[i] : String(v);
+    return `<div class="bar${readFlags && readFlags[i] ? " read" : ""}" style="height:${h}%" data-tip="${escapeHtml(tip)}"></div>`;
+  }).join("");
+}
+
+function renderRows(el, rows, labels) {
+  if (!rows.length) { el.innerHTML = `<p class="note">暂无数据</p>`; return; }
+  const max = Math.max(1, ...rows.map(r => r.count));
+  el.innerHTML = rows.map(r => {
+    const name = (labels && labels[r.name]) || r.name || "未分类";
+    return `<div class="r"><span title="${escapeHtml(name)}">${escapeHtml(name)}</span>
+      <span class="track"><span class="fill" style="width:${Math.round(r.count / max * 100)}%"></span></span>
+      <span class="n">${r.count}</span></div>`;
+  }).join("");
+}
+
+async function loadStats() {
+  const days = Number($("stat-days").value) || 14;
+  const a = await api("/api/analytics?days=" + days);
+  $("stat-total").textContent = a.total || 0;
+  const daily = a.daily || [];
+  const values = [], tips = [], readFlags = [];
+  for (const d of daily) {
+    values.push(d.writes || 0);
+    tips.push(`${d.day} 写入 ${d.writes || 0}`);
+    readFlags.push(false);
+    values.push(d.reads || 0);
+    tips.push(`${d.day} 读取 ${d.reads || 0}`);
+    readFlags.push(true);
+  }
+  renderBars($("stat-daily"), values, tips, readFlags);
+  const hours = a.by_hour || new Array(24).fill(0);
+  renderBars($("stat-hours"), hours, hours.map((n, i) => `${i}:00 · ${n}`));
+  renderRows($("stat-types"), a.by_type || []);
+  renderRows($("stat-apps"), a.top_apps || []);
+}
+
 function filters() {
   const p = new URLSearchParams();
   const put = (k, v) => { if (v) p.set(k, v); };
@@ -641,11 +714,15 @@ document.querySelectorAll("nav button").forEach(btn => {
   btn.onclick = () => {
     document.querySelectorAll("nav button").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
-    for (const id of ["logs", "rules", "clean", "settings", "help"]) {
+    for (const id of ["logs", "rules", "stats", "clean", "settings", "help"]) {
       $("tab-" + id).classList.toggle("hidden", btn.dataset.tab !== id);
     }
+    if (btn.dataset.tab === "stats") loadStats().catch(showErr);
   };
 });
+
+$("stat-refresh").onclick = () => loadStats().catch(showErr);
+$("stat-days").onchange = () => loadStats().catch(showErr);
 
 $("toggle").onclick = async () => {
   const status = await api("/api/status");

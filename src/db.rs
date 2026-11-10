@@ -150,6 +150,35 @@ pub struct DbStats {
     pub db_human: String,
 }
 
+/// 趋势与分布统计（供界面图表使用）。所有数值列都是明文，不需要解密。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Analytics {
+    /// 最近 N 天每日写入/读取数，按日期升序。
+    pub daily: Vec<DailyCount>,
+    /// 内容类型分布。
+    pub by_type: Vec<NamedCount>,
+    /// 事件最多的应用（写入方）。
+    pub top_apps: Vec<NamedCount>,
+    /// 24 小时分布（本地时区的小时由界面换算，这里给 UTC 小时）。
+    pub by_hour: Vec<i64>,
+    /// 事件总数与当前保留窗口内的天数。
+    pub total: i64,
+    pub days: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DailyCount {
+    pub day: String,
+    pub writes: i64,
+    pub reads: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct NamedCount {
+    pub name: String,
+    pub count: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EventFilter {
     pub app: Option<String>,
@@ -868,6 +897,95 @@ impl Database {
         let meta_json = self.dec_text(Some(meta_json))?.unwrap_or_default();
         let blob = self.dec_bytes(Some(blob))?.unwrap_or_default();
         Ok(Some((download_filename(&meta_json, &app_name), blob)))
+    }
+
+    /// 聚合统计：按天/类型/应用/小时分布。只查明文列，不解密正文。
+    pub fn analytics(&self, days: i64) -> Result<Analytics> {
+        let days = days.clamp(1, 365);
+        let since = crate::now_ms() - days * 86_400_000;
+        let mut daily: Vec<DailyCount> = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT date(ts_ms/1000, 'unixepoch', 'localtime') AS d,
+                        SUM(CASE WHEN op='write' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN op='read' THEN 1 ELSE 0 END)
+                 FROM events WHERE ts_ms >= ?1
+                 GROUP BY d ORDER BY d ASC",
+            )?;
+            let rows = stmt.query_map(params![since], |r| {
+                Ok(DailyCount {
+                    day: r.get(0)?,
+                    writes: r.get(1)?,
+                    reads: r.get(2)?,
+                })
+            })?;
+            for row in rows {
+                daily.push(row?);
+            }
+        }
+        let mut by_type = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT COALESCE(content_type,'unknown') AS t, COUNT(*)
+                 FROM events WHERE ts_ms >= ?1
+                 GROUP BY t ORDER BY COUNT(*) DESC LIMIT 12",
+            )?;
+            let rows = stmt.query_map(params![since], |r| {
+                Ok(NamedCount {
+                    name: r.get(0)?,
+                    count: r.get(1)?,
+                })
+            })?;
+            for row in rows {
+                by_type.push(row?);
+            }
+        }
+        let mut top_apps = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT COALESCE(NULLIF(app_name,''), COALESCE(NULLIF(source_app,''),'未知进程')) AS a,
+                        COUNT(*) FROM events WHERE ts_ms >= ?1
+                 GROUP BY a ORDER BY COUNT(*) DESC LIMIT 10",
+            )?;
+            let rows = stmt.query_map(params![since], |r| {
+                Ok(NamedCount {
+                    name: r.get(0)?,
+                    count: r.get(1)?,
+                })
+            })?;
+            for row in rows {
+                top_apps.push(row?);
+            }
+        }
+        let mut by_hour = vec![0i64; 24];
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT CAST(strftime('%H', ts_ms/1000, 'unixepoch', 'localtime') AS INTEGER) AS h,
+                        COUNT(*) FROM events WHERE ts_ms >= ?1 GROUP BY h",
+            )?;
+            let rows = stmt.query_map(params![since], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (h, n) = row?;
+                if (0..24).contains(&h) {
+                    by_hour[h as usize] = n;
+                }
+            }
+        }
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE ts_ms >= ?1",
+            params![since],
+            |r| r.get(0),
+        )?;
+        Ok(Analytics {
+            daily,
+            by_type,
+            top_apps,
+            by_hour,
+            total,
+            days,
+        })
     }
 
     pub fn distinct_apps(&self) -> Result<Vec<String>> {
@@ -1810,5 +1928,52 @@ mod tests {
             "密钥不匹配时应明确报错而不是静默继续: {eid}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn analytics_aggregates_by_day_type_app_and_hour() {
+        let (db, path) = tmp_db();
+        let now = crate::now_ms();
+        // 今天两条 text 写入，昨天一条 image 写入 + 一条读取。
+        text_event(&db, now - 3_600_000, "alpha-token", TYPE_TEXT);
+        text_event(&db, now - 7_200_000, "beta-token", TYPE_TEXT);
+        text_event(&db, now - 90_000_000, "old-token", TYPE_TEXT);
+        let read = NewEvent {
+            ts_ms: now - 90_000_000,
+            op: "read".into(),
+            selection: "CLIPBOARD".into(),
+            pid: None,
+            app_name: "reader".into(),
+            wm_class: String::new(),
+            exec_path: String::new(),
+            window_id: 0,
+            content_id: None,
+            content_type: "text".into(),
+            content_size: 0,
+            summary: "read old".into(),
+            targets: "UTF8_STRING".into(),
+            source_app: String::new(),
+            source_pid: None,
+            source_event_id: None,
+            truncated: false,
+            x_time: 0,
+            reason: "read".into(),
+            pending: false,
+        };
+        db.insert_event(&read).unwrap();
+        let a = db.analytics(14).unwrap();
+        assert!(a.total >= 3);
+        assert_eq!(a.days, 14);
+        assert_eq!(a.by_hour.len(), 24);
+        assert!(a.by_hour.iter().sum::<i64>() >= a.total - 1);
+        assert!(a.daily.iter().any(|d| d.writes > 0));
+        assert!(a.daily.iter().any(|d| d.reads > 0));
+        assert!(a.by_type.iter().any(|t| t.name == "text"));
+        assert!(a
+            .top_apps
+            .iter()
+            .any(|t| t.name == "gedit" || t.name == "reader"));
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 }
