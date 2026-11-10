@@ -1105,6 +1105,40 @@ mod tests {
     }
 
     #[test]
+    fn cmp_x_time_orders_wraparound_and_snapshots() {
+        let write = |seq: u64, x_time: u32| {
+            Incoming::Write(RawWrite {
+                seq,
+                wall_ms: 0,
+                x_time,
+                arrived: Instant::now(),
+                selection_name: "CLIPBOARD".into(),
+                selection_atom: 1,
+                owner: 1,
+                reason: "owner_change",
+            })
+        };
+        // 跨 wrap：0xffff_fff0 之后是 0x10。
+        let before = write(1, 0xffff_fff0);
+        let after = write(2, 0x10);
+        assert_eq!(cmp_x_time(&before, &after), std::cmp::Ordering::Less);
+        assert_eq!(cmp_x_time(&after, &before), std::cmp::Ordering::Greater);
+
+        // 快照（x_time=0）排在任何真实时间之前。
+        let snap = write(3, 0);
+        assert_eq!(cmp_x_time(&snap, &before), std::cmp::Ordering::Less);
+        assert_eq!(cmp_x_time(&before, &snap), std::cmp::Ordering::Greater);
+
+        // 时间相同按 seq 决定稳定顺序；同为 0 亦然。
+        let a = write(7, 1000);
+        let b = write(8, 1000);
+        assert_eq!(cmp_x_time(&a, &b), std::cmp::Ordering::Less);
+        let a0 = write(4, 0);
+        let b0 = write(5, 0);
+        assert_eq!(cmp_x_time(&a0, &b0), std::cmp::Ordering::Less);
+    }
+
+    #[test]
     fn new_write_closes_read_burst_window() {
         let (app, dir) = test_app(Config::default());
         let (job_tx, _job_rx) = mpsc::channel();
