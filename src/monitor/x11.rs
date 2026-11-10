@@ -433,25 +433,16 @@ fn pipeline_main(app: Arc<App>, rx: Receiver<Msg>, self_tx: Sender<Msg>) {
         .ok();
     let _ = ready_rx.recv_timeout(Duration::from_secs(5));
 
-    let resolver = match connect_x() {
-        Ok((conn, _)) => {
-            app.register_client(client_range(&conn));
-            match Resolver::new(conn) {
-                Ok(resolver) => Some(resolver),
-                Err(err) => {
-                    log_warn(format!("窗口解析连接失败: {err:#}"));
-                    None
-                }
-            }
-        }
-        Err(err) => {
-            log_warn(format!("窗口解析连接失败: {err:#}"));
-            None
-        }
-    };
-    let mut resolver = resolver;
+    let mut resolver = rebuild_resolver(&app);
+    if resolver.is_none() {
+        log_warn("窗口解析连接失败，来源将退化为 window-N，每 5 秒自动重试");
+    }
+    // 解析连接断开后在独立线程重建；connect 卡住时也不阻塞事件管线。
+    let (resolver_tx, resolver_rx) = mpsc::channel::<Option<Resolver>>();
+    let mut rebuilding = false;
     let mut buf: Vec<Incoming> = Vec::new();
     let mut bursts: HashMap<String, Burst> = HashMap::new();
+    let mut last_probe = Instant::now();
     loop {
         if app.shutdown.load(Ordering::Relaxed) {
             break;
@@ -463,6 +454,36 @@ fn pipeline_main(app: Arc<App>, rx: Receiver<Msg>, self_tx: Sender<Msg>) {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        if last_probe.elapsed() >= Duration::from_secs(5) {
+            last_probe = Instant::now();
+            if let Some(res) = resolver.as_ref() {
+                if !res.ping() {
+                    log_warn("窗口解析连接失效，开始重建");
+                    resolver = None;
+                }
+            }
+            if resolver.is_none() && !rebuilding {
+                rebuilding = true;
+                let rebuild_app = Arc::clone(&app);
+                let rebuild_tx = resolver_tx.clone();
+                let spawned =
+                    thread::Builder::new()
+                        .name("clip-resolver".into())
+                        .spawn(move || {
+                            let _ = rebuild_tx.send(rebuild_resolver(&rebuild_app));
+                        });
+                if spawned.is_err() {
+                    rebuilding = false;
+                }
+            }
+        }
+        while let Ok(result) = resolver_rx.try_recv() {
+            rebuilding = false;
+            if result.is_some() {
+                log_info("窗口解析连接已就绪");
+                resolver = result;
+            }
+        }
         if let Err(err) = flush_ready(&app, &mut resolver, &mut buf, &mut bursts, &job_tx) {
             log_warn(format!("写入日志失败: {err:#}"));
             app.note_error(&format!("写入日志失败: {err:#}"));
@@ -471,6 +492,25 @@ fn pipeline_main(app: Arc<App>, rx: Receiver<Msg>, self_tx: Sender<Msg>) {
     let _ = job_tx.send(Job::Stop);
     if let Some(worker) = worker {
         let _ = worker.join();
+    }
+}
+
+/// 连一次 X 并构建窗口解析器。失败返回 None，由调用方稍后重试。
+fn rebuild_resolver(app: &App) -> Option<Resolver> {
+    let (conn, _) = match connect_x() {
+        Ok(pair) => pair,
+        Err(err) => {
+            log_debug(format!("窗口解析连接失败: {err:#}"));
+            return None;
+        }
+    };
+    app.register_client(client_range(&conn));
+    match Resolver::new(conn) {
+        Ok(resolver) => Some(resolver),
+        Err(err) => {
+            log_warn(format!("重建窗口解析器失败: {err:#}"));
+            None
+        }
     }
 }
 

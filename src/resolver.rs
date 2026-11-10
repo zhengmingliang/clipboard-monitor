@@ -90,6 +90,14 @@ impl Resolver {
         info
     }
 
+    /// 轻量探测连接是否仍然可用。失败时调用方应重建 Resolver。
+    pub fn ping(&self) -> bool {
+        self.conn
+            .get_input_focus()
+            .map(|cookie| cookie.reply().is_ok())
+            .unwrap_or(false)
+    }
+
     pub fn atom_name(&mut self, atom: u32) -> String {
         if atom == 0 {
             return "NONE".to_string();
