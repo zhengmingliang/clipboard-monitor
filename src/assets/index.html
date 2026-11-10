@@ -282,6 +282,7 @@
         <label><input id="s-file-on" type="checkbox"> 保存小于上限的单个普通文件内容</label><br>
         <label><input id="s-primary" type="checkbox"> 同时监控主选择区 PRIMARY</label>
       </p>
+      <p class="note">PRIMARY 是「选中文字即写入、中键粘贴即读取」的选择区；开启后每次拖动选中都会连续产生写入与读取记录，普通使用建议保持关闭。默认关闭，旧配置若已开启请在此取消勾选并保存。</p>
       <p><button id="save-settings" class="primary">保存设置</button> <span id="s-msg" class="note"></span></p>
     </div>
   </section>
@@ -291,7 +292,8 @@
       <h2>这是什么</h2>
       <p>它记录本机剪贴板的文本与图片变化，日志留在本地 SQLite，不上传。Linux/X11 还支持来源进程、PRIMARY 选择区和读取审计。</p>
       <h2>平台差异</h2>
-      <p>Windows 使用 WM_CLIPBOARDUPDATE 通知；macOS 最多每 2 秒做一次内容摘要采样；Linux 使用 XFixes/RECORD。Windows/macOS 不提供可靠的复制者进程归属和全局读取审计，因此界面不会显示这些能力。</p>
+      <p>Windows 使用 WM_CLIPBOARDUPDATE 通知 + 序号预检；macOS 用 changeCount 快速路径并以最多每 2 秒的内容摘要采样兜底；Linux 使用 XFixes/RECORD，只有它能可靠审计读取。</p>
+      <p><strong>Windows 的「推断读取」</strong>：Win32 在读取粘贴时不发任何通知。本程序用「其它进程打开剪贴板且序号未变」的轮询 + Ctrl+V 低级键盘钩子交叉推断，事件标为 <code>reason=inferred_read</code>、摘要里带判定依据。它是尽力而为的估计：菜单粘贴、极短读取可能漏掉，剪贴板管理器同步也可能被算作读取，<strong>不等价于可靠的全局读取审计</strong>。macOS 不产生读取事件。</p>
       <h2>记录规则</h2>
       <ul>
         <li>纯文本、富文本：小于 1MB（可改）保存原文，达到上限只留大小和开头一段。</li>

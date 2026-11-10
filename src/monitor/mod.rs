@@ -32,6 +32,8 @@ use portable as backend;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
+mod read_signal;
+#[cfg(target_os = "windows")]
 mod win32;
 
 #[cfg(target_os = "linux")]
@@ -355,6 +357,106 @@ impl App {
         self.counters.last_event_ms.store(ts_ms, Ordering::Relaxed);
         Ok(content_id)
     }
+
+    /// Windows 推断读取：只插一条 `op="read"` 事件，复用当前剪贴板内容行，
+    /// 不新建 contents、不改动快照。读取方进程信息来自 `ReadSignal`。
+    #[cfg(any(target_os = "windows", test))]
+    pub(crate) fn record_read_event(
+        &self,
+        signal: &crate::monitor::observation::ReadSignal,
+        ts_ms: i64,
+    ) -> Result<()> {
+        use crate::monitor::observation::{is_source_whitelisted, WhitelistContext};
+
+        let reader = signal.reader.clone().unwrap_or_default();
+        let (whitelist, self_pid, self_exe) = {
+            let cfg = self.config.read().unwrap_or_else(|e| e.into_inner());
+            (cfg.whitelist.clone(), self.self_pid, self.self_exe.clone())
+        };
+        if is_source_whitelisted(
+            signal.reader.as_ref(),
+            &WhitelistContext {
+                list: &whitelist,
+                self_pid,
+                self_exe: &self_exe,
+            },
+        ) {
+            return Ok(());
+        }
+        let content_id = self
+            .snaps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("CLIPBOARD")
+            .and_then(|s| s.content_id);
+        // 摘要、格式与内容类型沿用最近一条写入事件；没有写入记录时退化。
+        let (mut summary, targets, content_type, size, truncated, source_app, source_pid) = {
+            let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+            let filter = crate::db::EventFilter {
+                op: Some("write".into()),
+                ..Default::default()
+            };
+            let (rows, _) = db.query_events(&filter, 1, 0)?;
+            match rows.first() {
+                Some(row) => (
+                    row.summary.clone(),
+                    row.targets.clone(),
+                    row.content_type.clone(),
+                    row.content_size as u64,
+                    row.truncated,
+                    row.source_app.clone(),
+                    row.source_pid,
+                ),
+                None => (
+                    "推断读取（剪贴板内容未变）".to_string(),
+                    String::new(),
+                    "custom".to_string(),
+                    0,
+                    false,
+                    String::new(),
+                    None,
+                ),
+            }
+        };
+        // events 表没有 meta_json 列，把判定依据编码进 summary 后缀，
+        // 详情页会同时展示 reason=inferred_read 与这段说明。
+        summary.push_str(&format!(" · 推断读取依据：{}", signal.evidence));
+        if let Some(trigger) = &signal.trigger {
+            if !trigger.app_name.is_empty() {
+                summary.push_str(&format!(" · 前台：{}", trigger.app_name));
+            }
+        }
+        if summary.chars().count() > 240 {
+            summary = summary.chars().take(239).collect::<String>() + "…";
+        }
+        let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        db.insert_event(&NewEvent {
+            ts_ms,
+            op: "read".into(),
+            selection: "CLIPBOARD".into(),
+            pid: reader.pid,
+            app_name: reader.app_name.clone(),
+            wm_class: String::new(),
+            exec_path: reader.exec_path.clone(),
+            window_id: reader.window_id,
+            content_id,
+            content_type,
+            content_size: size,
+            summary,
+            targets,
+            source_app,
+            source_pid: source_pid.and_then(|p| i32::try_from(p).ok()),
+            source_event_id: None,
+            truncated,
+            x_time: 0,
+            reason: "inferred_read".into(),
+            pending: false,
+        })?;
+        drop(db);
+        self.counters.reads.fetch_add(1, Ordering::Relaxed);
+        self.counters.last_event_ms.store(ts_ms, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 pub struct Threads {
@@ -531,6 +633,113 @@ mod tests {
         let db = app.db.lock().unwrap();
         let (_events, total) = db.query_events(&EventFilter::default(), 10, 0).unwrap();
         assert_eq!(total, 0, "白名单命中不应产生 events 行");
+        drop(db);
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn inferred_read_event_reuses_content_and_records_evidence() {
+        use crate::monitor::observation::{
+            classify_event, ClipboardObservation, ReadSignal, SourceInfo, TriggerInfo,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "clipboard-monitor-read-test-{}-{}",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        let db = Database::open(&dir.join("monitor.db")).expect("open test database");
+        let app = App::new(db, Config::default(), dir.join("config.json"));
+        let mut obs = ClipboardObservation::new(assemble(
+            &FetchInput {
+                plain: Some(b"copied text".to_vec()),
+                plain_mime: Some("text/plain".into()),
+                plain_total: 11,
+                target_names: vec!["text/plain".into()],
+                ..FetchInput::default()
+            },
+            &Limits::default(),
+        ));
+        obs.formats = vec!["text/plain".into()];
+        obs.sequence = Some(9);
+        let spec = classify_event(None, &obs).expect("首条观察应落库");
+        let content_id = app.record_change(&obs, &spec, 1000).expect("写入");
+
+        let signal = ReadSignal {
+            evidence: "both",
+            reader: Some(SourceInfo {
+                pid: Some(4321),
+                app_name: "notepad".into(),
+                exec_path: "C:\\notepad.exe".into(),
+                window_id: 11,
+            }),
+            trigger: Some(TriggerInfo {
+                pid: Some(4321),
+                app_name: "notepad".into(),
+                window_title: String::new(),
+            }),
+        };
+        app.record_read_event(&signal, 1500).expect("推断读取");
+
+        assert_eq!(app.counters.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(app.counters.reads.load(Ordering::Relaxed), 1);
+        let db = app.db.lock().unwrap();
+        let (events, total) = db.query_events(&EventFilter::default(), 10, 0).unwrap();
+        assert_eq!(total, 2);
+        let read = events.iter().find(|e| e.op == "read").expect("应有读事件");
+        assert_eq!(
+            read.content_id,
+            Some(content_id),
+            "读事件复用同一 contents 行"
+        );
+        assert_eq!(read.reason, "inferred_read");
+        assert_eq!(read.pid, Some(4321));
+        assert_eq!(read.app_name, "notepad");
+        assert_eq!(read.exec_path, "C:\\notepad.exe");
+        assert_eq!(read.window_id, Some(11));
+        assert!(
+            read.summary.contains("both"),
+            "摘要应写明判定依据，实际: {}",
+            read.summary
+        );
+        assert_eq!(read.content_type, "text");
+        // 读事件不新建 contents 行。
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.contents, 1);
+        drop(db);
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn whitelisted_reader_suppresses_inferred_read() {
+        use crate::monitor::observation::{ReadSignal, SourceInfo};
+
+        let dir = std::env::temp_dir().join(format!(
+            "clipboard-monitor-read-whitelist-test-{}-{}",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        let config = Config {
+            whitelist: vec!["SecretApp".into()],
+            ..Config::default()
+        };
+        let db = Database::open(&dir.join("monitor.db")).expect("open test database");
+        let app = App::new(db, config, dir.join("config.json"));
+        let signal = ReadSignal {
+            evidence: "ctrl_v",
+            reader: Some(SourceInfo {
+                app_name: "SecretApp".into(),
+                ..Default::default()
+            }),
+            trigger: None,
+        };
+        app.record_read_event(&signal, 1000).expect("推断读取");
+        assert_eq!(app.counters.reads.load(Ordering::Relaxed), 0);
+        let db = app.db.lock().unwrap();
+        let (_events, total) = db.query_events(&EventFilter::default(), 10, 0).unwrap();
+        assert_eq!(total, 0, "白名单读取方不应产生事件");
         drop(db);
         drop(app);
         let _ = std::fs::remove_dir_all(dir);

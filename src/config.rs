@@ -32,7 +32,8 @@ pub struct Config {
     pub file_content_limit_bytes: u64,
     /// 为真时，单个小于上限的普通文件会保存内容。默认关闭。
     pub record_file_content: bool,
-    /// 同时监控 PRIMARY 选择区（鼠标中键选中）。
+    /// 同时监控 PRIMARY 选择区（选中文字即写入、中键粘贴即读取）。
+    /// 默认关闭：选中文字会连续产生写入与读取事件，普通使用场景噪音很大。
     pub monitor_primary: bool,
     /// 进程名、可执行文件名或 WM_CLASS，命中后不记录该应用自己的操作。
     pub whitelist: Vec<String>,
@@ -50,7 +51,7 @@ impl Default for Config {
             text_preview_bytes: DEFAULT_TEXT_PREVIEW,
             file_content_limit_bytes: DEFAULT_FILE_CONTENT_LIMIT,
             record_file_content: false,
-            monitor_primary: true,
+            monitor_primary: false,
             whitelist: Vec::new(),
             enabled_on_start: true,
         }
@@ -526,6 +527,10 @@ mod tests {
     fn validates_defaults_and_rejects_bad_retention() {
         let mut cfg = Config::default();
         cfg.validate().unwrap();
+        assert!(
+            !cfg.monitor_primary,
+            "PRIMARY 默认关闭，避免选中文字刷屏；需要时用户手动开启"
+        );
         cfg.retention_days = 0;
         assert!(cfg.validate().is_err());
     }

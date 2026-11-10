@@ -1186,4 +1186,45 @@ mod tests {
         drop(app);
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn default_config_does_not_monitor_primary() {
+        // 选中文字会连续产生 PRIMARY 写入与读取，默认配置必须只监控
+        // CLIPBOARD；用户显式打开 monitor_primary 才加入 PRIMARY。
+        let atoms = crate::fetch::Atoms {
+            clipboard: 1,
+            primary: 2,
+            targets: 3,
+            utf8: 4,
+            string: 5,
+            text: 6,
+            plain: 7,
+            plain_utf8: 8,
+            html: 9,
+            rtf: 10,
+            app_rtf: 11,
+            rich: 12,
+            png: 13,
+            jpeg: 14,
+            bmp: 15,
+            gif: 16,
+            webp: 17,
+            uri_list: 18,
+            gnome: 19,
+            moz: 20,
+            kde_cut: 21,
+            incr: 22,
+            prop: 23,
+        };
+        let cfg = Config::default();
+        assert!(!cfg.monitor_primary);
+        assert_eq!(
+            selection_pairs(&atoms, cfg.monitor_primary),
+            vec![("CLIPBOARD", 1u32)]
+        );
+        assert_eq!(
+            selection_pairs(&atoms, true),
+            vec![("CLIPBOARD", 1u32), ("PRIMARY", 2u32)]
+        );
+    }
 }

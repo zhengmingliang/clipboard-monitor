@@ -74,7 +74,7 @@ static CAPTURE_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 
 /// 在独立线程里执行抓取，避免一次阻塞的剪贴板调用卡死后端循环。
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn capture_with_timeout(app: &Arc<App>, inferred_read: bool) -> CaptureResult {
+fn capture_with_timeout(app: &Arc<App>) -> CaptureResult {
     use std::sync::atomic::Ordering as AtomicOrdering;
 
     if CAPTURE_IN_FLIGHT.swap(true, AtomicOrdering::SeqCst) {
@@ -86,7 +86,7 @@ fn capture_with_timeout(app: &Arc<App>, inferred_read: bool) -> CaptureResult {
     let worker = thread::Builder::new()
         .name("clip-capture".into())
         .spawn(move || {
-            let result = capture_observation(&app, inferred_read);
+            let result = capture_observation(&app);
             let _ = tx.send(result);
             // 无论成功失败都清标志；超时的旧线程最终结束也会清。
             CAPTURE_IN_FLIGHT.store(false, AtomicOrdering::SeqCst);
@@ -115,7 +115,7 @@ fn capture_with_timeout(app: &Arc<App>, inferred_read: bool) -> CaptureResult {
 
 /// 整理一次完整观察：内容 + 格式清单 + 变更序号 + 来源/触发主体。
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn capture_observation(app: &App, inferred_read: bool) -> CaptureResult {
+fn capture_observation(app: &App) -> CaptureResult {
     let mut clipboard = Clipboard::new().context("初始化系统剪贴板")?;
     let limits = {
         let cfg = app.config.read().unwrap_or_else(|e| e.into_inner());
@@ -125,7 +125,7 @@ fn capture_observation(app: &App, inferred_read: bool) -> CaptureResult {
     // arboard 的 Clipboard 在 Windows 上内部持有 OpenClipboard；先释放再
     // 调平台的格式枚举/所有者查询，避免同线程嵌套打开剪贴板失败。
     drop(clipboard);
-    decorate_observation(&mut obs, inferred_read);
+    decorate_observation(&mut obs);
     Ok(obs)
 }
 
@@ -185,7 +185,7 @@ fn capture_from(
 /// 补齐平台相关的观察字段（格式清单、序号、来源、触发主体）。
 /// 每个采集点独立降级：任一失败都不让整次抓取失败。
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn decorate_observation(obs: &mut ClipboardObservation, inferred_read: bool) {
+fn decorate_observation(obs: &mut ClipboardObservation) {
     #[cfg(target_os = "windows")]
     {
         obs.sequence = Some(crate::monitor::win32::clipboard_sequence());
@@ -197,9 +197,7 @@ fn decorate_observation(obs: &mut ClipboardObservation, inferred_read: bool) {
         obs.source = source;
         obs.source_attribution = Some(attribution.to_string());
         obs.trigger = crate::monitor::win32::foreground_trigger();
-        // Windows 是唯一能间接推断读取的平台：序号没变却收到变更通知，
-        // 说明某个客户端触发了延迟渲染。仅此一处允许置位。
-        obs.inferred_read = inferred_read;
+        // 推断读取由 read_signal 独立落库，不经过内容抓取管线。
     }
     #[cfg(target_os = "macos")]
     {
@@ -212,8 +210,6 @@ fn decorate_observation(obs: &mut ClipboardObservation, inferred_read: bool) {
         obs.source_attribution = Some("frontmost_app".to_string());
         obs.trigger = crate::monitor::macos::foreground_trigger();
         // macOS 没有任何读取信号，永不产生推断读取。
-        obs.inferred_read = false;
-        let _ = inferred_read;
     }
     if obs.formats.is_empty() && !obs.body.targets.is_empty() {
         obs.formats = obs.body.targets.clone();
@@ -287,7 +283,7 @@ fn rgba_sha256(width: u32, height: u32, rgba: &[u8]) -> String {
 fn run_loop(
     app: Arc<App>,
     mut wait_for_signal: impl FnMut(Duration) -> bool,
-    mut inferred_signal: impl FnMut() -> bool,
+    mut drain_reads: impl FnMut(&App),
 ) {
     let mut snapshot: Option<ObservationSnapshot> = None;
     let mut last_probe = Instant::now() - FALLBACK_PROBE;
@@ -298,6 +294,9 @@ fn run_loop(
         if app.shutdown.load(Ordering::Relaxed) {
             break;
         }
+        // 读取信号与内容变化无关，独立消费：即使剪贴板内容没变、或监控
+        // 处于暂停沿，也把已捕获的疑似读取落库（暂停期间忽略由闭包判断）。
+        drain_reads(&app);
         let enabled = app.enabled.load(Ordering::Relaxed);
         // 启用沿：清空暂停标记，保证恢复后即使内容相同也留一条 reenabled。
         if !enabled {
@@ -321,10 +320,8 @@ fn run_loop(
             continue;
         }
 
-        // 只有"收到消息/序号变化"这一轮才可能带推断读取信号；兜底采样
-        // 轮不消费该标志，避免把上一轮的残留当成新一轮读取。
-        let inferred = signal && inferred_signal();
-        match capture_with_timeout(&app, inferred) {
+        // 推断读取由 drain_reads 独立落库，与内容抓取管线解耦。
+        match capture_with_timeout(&app) {
             Ok(obs) => {
                 last_probe = Instant::now();
                 if process_observation(&app, &obs, &mut snapshot) {
@@ -368,7 +365,7 @@ mod platform {
                 last_count = count;
                 changed
             },
-            || false,
+            |_app| {}, // macOS 不产生读取事件
         );
     }
 }
@@ -425,12 +422,11 @@ mod platform {
             return;
         };
         let hwnd = window.0;
-        log_info("Windows 剪贴板监听已启动（WM_CLIPBOARDUPDATE + 序号预检）");
+        log_info("Windows 剪贴板监听已启动（WM_CLIPBOARDUPDATE + 读取信号）");
         let mut last_sequence = crate::monitor::win32::clipboard_sequence();
-        // 两个闭包共享同一个标志，避免 move 各自捕获一份副本导致推断信号丢失。
-        let pending_notification = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let signal_flag = Arc::clone(&pending_notification);
-        let read_flag = Arc::clone(&pending_notification);
+        // 读取信号在独立线程采集：OpenClipboard 轮询 + Ctrl+V 钩子。
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (read_rx, read_handle) = crate::monitor::read_signal::spawn(Arc::clone(&shutdown));
 
         run_loop(
             Arc::clone(&app),
@@ -458,16 +454,25 @@ mod platform {
                 }
                 let sequence = crate::monitor::win32::clipboard_sequence();
                 let seq_changed = sequence != 0 && sequence != last_sequence;
-                // 序号没变但收到通知：可能是延迟渲染被某个读取请求触发。
-                signal_flag.store(
-                    notified && !seq_changed,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
                 last_sequence = sequence;
                 notified || seq_changed
             },
-            move || read_flag.swap(false, std::sync::atomic::Ordering::Relaxed),
+            |app| {
+                // 每轮把已捕获的疑似读取落库；与内容变化管线完全解耦。
+                while let Ok(signal) = read_rx.try_recv() {
+                    if !app.enabled.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    if let Err(err) = app.record_read_event(&signal, crate::now_ms()) {
+                        let message = format!("记录推断读取失败: {err:#}");
+                        log_warn(&message);
+                        app.note_error(&message);
+                    }
+                }
+            },
         );
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = read_handle.join();
         // window 在此析构：移除监听并销毁窗口。
         drop(window);
     }

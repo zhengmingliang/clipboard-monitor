@@ -6,13 +6,20 @@
 
 | 平台 | 变化检测 | 文本 | 图片 | 事件与元数据 |
 | --- | --- | --- | --- | --- |
-| Windows | `WM_CLIPBOARDUPDATE` + `GetClipboardSequenceNumber` 廉价预检，内容摘要兜底 | Unicode 文本 | 系统图片记录尺寸与完整摘要 | 内容/清空/格式/序号变化区分；格式清单；剪贴板所有者 → PID / 进程路径；前台触发主体；序号未变时的**推断读取** |
+| Windows | `WM_CLIPBOARDUPDATE` + `GetClipboardSequenceNumber` 廉价预检，内容摘要兜底 | Unicode 文本 | 系统图片记录尺寸与完整摘要 | 内容/清空/格式/序号变化区分；格式清单；剪贴板所有者 → PID / 进程路径；前台触发主体；`GetOpenClipboardWindow` 轮询 + Ctrl+V 钩子交叉推断的**推断读取** |
 | macOS | `NSPasteboard.changeCount` 快速路径 + 最多每 2 秒内容摘要采样兜底（无窗口会话兼容） | Unicode 文本 | TIFF 等系统图片记录尺寸与完整摘要 | 内容/清空/格式/序号变化区分；格式清单；前台应用 PID / 名称 / 路径 |
-| Linux/X11 | XFixes 事件，空闲时不轮询内容 | 纯文本、富文本 | PNG/JPEG/GIF/WebP/BMP 等格式元数据 | PRIMARY、XRes 来源进程、ConvertSelection **可靠**读取审计、读写流转链 |
+| Linux/X11 | XFixes 事件，空闲时不轮询内容 | 纯文本、富文本 | PNG/JPEG/GIF/WebP/BMP 等格式元数据 | PRIMARY（默认关闭，见 `monitor_primary`）、XRes 来源进程、ConvertSelection **可靠**读取审计、读写流转链 |
 
 **事件语义（三平台一致）**：`op` 只有 `write` / `read` 两种。写入事件的 `reason` 区分 `snapshot`（启动快照）、`content_change`、`cleared`、`format_change`（内容相同但格式集合变了）、`sequence_change`（内容与格式相同但 OS 变更序号变了）、`reenabled`（暂停后恢复）；X11 另有 `owner_change` / `window_destroy` / `client_close`。快速连续复制 A→B→A 不会被最终状态吞掉。所有事件在 `meta_json.change` 里带判定依据，`meta_json.formats` / `sequence` 记录格式清单与 OS 序号。
 
-**读取能力的诚实边界**：只有 Linux/X11 能通过 RECORD 拦截 `ConvertSelection`，得到可靠的全局读取审计（`capabilities.reads=true`）。Windows 的 `capabilities.reads_inferred=true` 只表示"变更序号没变却收到变更通知"这种间接信号，事件标为 `op=read` + `reason=inferred_read` + `meta_json.change.inferred=true`，界面显示"推断读取"，**不冒充可靠审计**；macOS 不产生任何读取事件。界面据此隐藏/放开"读取"筛选与流转链。
+**读取能力的诚实边界**：只有 Linux/X11 能通过 RECORD 拦截 `ConvertSelection`，得到可靠的全局读取审计（`capabilities.reads=true`）。
+
+Windows 的 `capabilities.reads_inferred=true` 是**尽力而为的推断**，因为 Win32 在读取粘贴时不发任何系统通知（`WM_CLIPBOARDUPDATE` 只在内容变化时触发，序号也不随读取递增）。`read_signal.rs` 用两条间接信号交叉验证：
+
+1. 每 100ms 轮询 `GetOpenClipboardWindow()`：任何读取/粘贴都必须先 `OpenClipboard`；当别的进程持有剪贴板、且剪贴板变更序号没变（说明不是写入）时，视为疑似读取，并取该窗口的 PID / 进程路径作为读取方。
+2. `WH_KEYBOARD_LL` 低级键盘钩子捕获 Ctrl+V：作为独立佐证，补足轮询可能漏掉的极短读取；钩子回调只写原子时间戳，不阻塞。
+
+两信号在 300ms 窗口内去重，落库为 `op=read` + `reason=inferred_read`，摘要里写明判定依据（`open_clipboard` / `ctrl_v` / `both`），界面显示"推断读取"。**它不是可靠的全局审计**：菜单粘贴、自绘控件的直接 API 读取可能漏掉；剪贴板管理器/RDP 同步也可能被算作读取；钩子在权限受限或会话隔离时可能装不上，此时仅靠轮询降级运行。macOS 不产生任何读取事件。界面据此隐藏/放开"读取"筛选与流转链。
 
 **元数据（OS 可可靠提供的全部）**：Windows 采集 `GetClipboardOwner` → `GetWindowThreadProcessId` → `QueryFullProcessImageNameW`（写入者 PID / 应用名 / 可执行路径 / 窗口句柄），以及 `GetForegroundWindow` + `GetWindowTextW`（触发主体）；macOS 采集 `NSWorkspace.frontmostApplication` + `proc_pidpath`（前台应用 PID / 名称 / bundle id / 路径）。无窗口/headless 会话里若剪贴板没有所有者窗口，Windows 会回退到前台应用并在 `meta_json.source.attribution` 标为 `foreground_fallback`（`window_id` 留 0，不冒充所有者）；两者都取不到时标 `unavailable` 并写明原因，保证每条记录都能解释自己的元数据完整度，绝不填误导性数值。`wm_class` 是 X11 概念，Windows/macOS 恒为空；`window_id` 在 macOS 没有对应概念，恒为 0。来源与触发主体另外写进 `meta_json.source` / `meta_json.trigger`，详情页展示归属方式。
 
@@ -84,7 +91,7 @@ SQLite 编进可执行文件，不需要单独安装数据库。Windows 发布�
 | `text_preview_bytes` | `4096` | 超限文本保留的前缀 |
 | `file_content_limit_bytes` | `2097152` | X11 单文件内容保存上限 |
 | `record_file_content` | `false` | 是否保存 X11 单个小文件内容 |
-| `monitor_primary` | `true` | X11 是否监控 PRIMARY |
+| `monitor_primary` | `false` | X11 是否监控 PRIMARY（选中文字即写入、中键粘贴即读取，开启后选中操作会产生多条记录，普通使用建议关闭） |
 | `whitelist` | `[]` | 不记录的程序（三平台生效，命中即正文零落盘） |
 | `enabled_on_start` | `true` | 启动时是否立即监控 |
 
@@ -157,7 +164,7 @@ CI 在五个原生架构上按同一份契约校验，平台专有能力单独�
 
 | # | 校验项 | 三平台共同要求 | 平台差异 |
 | --- | --- | --- | --- |
-| 1 | 事件类型完整性 | 每次内容变化恰好一条 `write`；`op` 只允许 `write`/`read`；清空、格式变化、序号变化、启动快照、暂停恢复各有明确 `reason` | 只有 X11 有可靠 `read`（RECORD）；Windows 的 `read` 恒为 `reason=inferred_read` 且标注 `inferred=true`；macOS 无 `read` |
+| 1 | 事件类型完整性 | 每次内容变化恰好一条 `write`；`op` 只允许 `write`/`read`；清空、格式变化、序号变化、启动快照、暂停恢复各有明确 `reason` | 只有 X11 有可靠 `read`（RECORD）；Windows 的 `read` 由 `GetOpenClipboardWindow` 轮询 + Ctrl+V 钩子推断，恒为 `reason=inferred_read` 并在摘要写明依据；macOS 无 `read` |
 | 2 | 元数据完整性 | `NewEvent` 列集合相同；来源/触发主体写入 `meta_json.source`/`trigger`；无法可靠采集的字段显式留空，不填误导值 | `wm_class` 仅 X11；macOS `window_id` 恒 0；Windows 用剪贴板所有者、macOS 用前台应用 |
 | 3 | 去重与内容保真 | 同一内容+格式+序号连续通知不产生重复行；`body`/`blob`/`meta_json`/`sha256`/截断规则由共享 `classify::assemble` 保证一致 | X11 按所有权变化记录，不要求内容级去重；Win/mac 按指纹（内容+格式+序号）去重 |
 | 4 | 异常恢复与可观测性 | 后端失效要么自动恢复并把 `changes_ready` 置真，要么写入 `last_error` 并置假；不得静默死亡；单次抓取有超时保护 | X11 有 `x_supervisor` 重连；Win/mac 有监听初始化退避重试、连续失败降级 |
@@ -189,6 +196,7 @@ git push origin v1.0.0
 ## 已知限制
 
 - Linux 仅支持 X11/XWayland，不支持原生 Wayland data-control。
+- X11 的 PRIMARY 选择区在选中文字时就会写入、中键粘贴时产生读取，开启 `monitor_primary` 后会出现大量由单纯选中操作引发的写入/读取记录；默认已关闭，旧配置里若为 `true` 请在设置中取消勾选。
 - 程序如果在自己的进程里缓存旧内容，不再向 X 服务器请求，就不会产生 X11 读取记录。
 - X11 所有者如果在内容被取走前退出，对应写入会留下“没有取到内容”的说明。
 - Windows/macOS 的 OS 不提供全局读取拦截：Windows 只有 `reason=inferred_read` 的间接推断，macOS 完全没有读取事件；两者都不等价于 X11 的可靠读取审计。

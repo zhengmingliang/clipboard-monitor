@@ -5,9 +5,10 @@
 //! 语义落库。这里有平台 cfg，Linux 也能编译并单测整条判定链路。
 //!
 //! 与 X11 后端的分工：X11 通过 XFixes/RECORD 直接拿到"谁写/谁读"的协议事件，
-//! 读取是可靠的；Windows/macOS 的 OS 不提供全局读取拦截，只能靠变更序号和
-//! 内容采样推断。推断出的读取永远带 `op="read"` + `reason="inferred_read"`，
-//! 并在 `meta_json.change` 里标注 `inferred: true`，绝不冒充可靠审计。
+//! 读取是可靠的；Windows/macOS 的 OS 不提供全局读取拦截。Windows 的推断读取
+//! 由 `read_signal.rs` + `App::record_read_event` 独立落库，永远带
+//! `op="read"` + `reason="inferred_read"` 并在摘要写明判定依据，
+//! 绝不冒充可靠审计；macOS 不产生读取事件。
 
 use crate::classify::Captured;
 
@@ -45,6 +46,18 @@ impl TriggerInfo {
     }
 }
 
+/// 一次疑似读取（粘贴）的间接信号，供 Windows 推断读取使用。
+/// 平台无关定义，便于在 Linux 单测里覆盖落库逻辑。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadSignal {
+    /// 触发来源：`open_clipboard` / `ctrl_v` / `both`。
+    pub evidence: &'static str,
+    /// 持有剪贴板的窗口对应进程（读取方），可能取不到。
+    pub reader: Option<SourceInfo>,
+    /// Ctrl+V 发生时的前台应用（触发主体），可能取不到。
+    pub trigger: Option<TriggerInfo>,
+}
+
 /// 一次剪贴板抓取的完整观察结果。
 #[derive(Debug, Clone)]
 pub struct ClipboardObservation {
@@ -62,8 +75,13 @@ pub struct ClipboardObservation {
     pub source_attribution: Option<String>,
     pub trigger: Option<TriggerInfo>,
     pub is_empty: bool,
-    /// 该次通知是否疑似"读取触发的延迟渲染"，仅 Windows 会置 true。
-    /// 置位不代表确实发生了读取，只是 OS 给出了间接信号。
+    /// 该次通知是否疑似"读取触发的延迟渲染"。
+    ///
+    /// 目前 Windows 的推断读取走 `App::record_read_event` 独立落库（由
+    /// `read_signal.rs` 的 OpenClipboard 轮询 + Ctrl+V 钩子驱动），不经过
+    /// 内容抓取管线，因此生产代码里此字段恒为 false。保留该字段与
+    /// `classify_event` 的对应分支，供未来 OS 提供读取信号时复用；单测
+    /// 覆盖其判定契约。
     pub inferred_read: bool,
 }
 

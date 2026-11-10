@@ -8,9 +8,8 @@
 //! - `GetForegroundWindow` + `GetWindowTextW`：动作发生时的触发主体。
 //!
 //! OS **不能**可靠提供的是"谁读取/粘贴了内容"：Windows 没有全局读取通知。
-//! 唯一能间接推断的场景是"序号没变却收到 WM_CLIPBOARDUPDATE"（延迟渲染
-//! 的所有者因某个请求重新声明格式），这类事件会被标为 `inferred_read`，
-//! 绝不声称是可靠的读取审计。
+//! `read_signal.rs` 用 `GetOpenClipboardWindow` 轮询与 Ctrl+V 钩子做间接
+//! 推断，结果一律标为 `inferred_read`，绝不声称是可靠的读取审计。
 
 use crate::monitor::observation::{SourceInfo, TriggerInfo};
 use std::path::PathBuf;
@@ -104,6 +103,43 @@ pub fn clipboard_source() -> (Option<SourceInfo>, &'static str) {
     )
 }
 
+/// 前台窗口的进程信息，供读取信号模块复用。
+/// 返回（信息，归属方式）；无前台窗口时返回 `(None, "unavailable")`。
+pub fn foreground_source() -> (Option<SourceInfo>, &'static str) {
+    let hwnd: HWND = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        return (None, "unavailable");
+    }
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    if pid == 0 {
+        return (
+            Some(SourceInfo {
+                window_id: hwnd as usize as u32,
+                ..Default::default()
+            }),
+            "foreground",
+        );
+    }
+    let path = process_image_path(pid);
+    let app_name = path
+        .as_ref()
+        .and_then(|p| p.file_stem())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    (
+        Some(SourceInfo {
+            pid: Some(pid as i32),
+            app_name,
+            exec_path: path
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            window_id: hwnd as usize as u32,
+        }),
+        "foreground",
+    )
+}
+
 /// 前台窗口/应用（触发主体）。与内容生产者可能不同，单列以免混淆。
 pub fn foreground_trigger() -> Option<TriggerInfo> {
     let hwnd: HWND = unsafe { GetForegroundWindow() };
@@ -137,7 +173,7 @@ pub fn foreground_trigger() -> Option<TriggerInfo> {
 /// 用 `PROCESS_QUERY_LIMITED_INFORMATION` 取进程完整路径。
 /// 与 `main.rs` 的 `process_path` 是同一套 Win32 调用，这里单独保留一份，
 /// 避免把 CLI 的进程管理逻辑耦合进监控后端。
-fn process_image_path(pid: u32) -> Option<PathBuf> {
+pub(super) fn process_image_path(pid: u32) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
