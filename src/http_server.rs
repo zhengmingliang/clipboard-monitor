@@ -11,11 +11,24 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const INDEX_HTML: &str = include_str!("assets/index.html");
+
+/// 同时处理的连接上限。慢速客户端最多占满这些线程，其余请求立即得到 503。
+const MAX_HTTP_CONNS: usize = 8;
+
+static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
+
+struct ConnGuard;
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        ACTIVE_CONNS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 pub fn serve(app: Arc<App>) -> Result<()> {
     let listen = app
@@ -41,10 +54,25 @@ pub fn serve(app: Arc<App>) -> Result<()> {
     while !app.shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
+                if ACTIVE_CONNS.load(Ordering::Relaxed) >= MAX_HTTP_CONNS {
+                    reject_overloaded(stream);
+                    continue;
+                }
+                ACTIVE_CONNS.fetch_add(1, Ordering::Relaxed);
                 let app = Arc::clone(&app);
-                // 请求很少，串行处理即可，避免再开线程堆内存。
-                if let Err(err) = handle_client(app, stream, port) {
-                    crate::log_debug(format!("HTTP: {err:#}"));
+                // 每个连接独立线程，慢客户端不再拖住其它请求；线程数受上限约束。
+                let spawned = std::thread::Builder::new()
+                    .name("clip-http-conn".into())
+                    .spawn(move || {
+                        let _guard = ConnGuard;
+                        if let Err(err) = handle_client(app, stream, port) {
+                            crate::log_debug(format!("HTTP: {err:#}"));
+                        }
+                    });
+                if spawned.is_err() {
+                    // 闭包随 spawn 失败一起丢弃，连接随之关闭；ACTIVE_CONNS 由连接内计数不受影响。
+                    ACTIVE_CONNS.fetch_sub(1, Ordering::Relaxed);
+                    crate::log_warn("HTTP 线程创建失败，丢弃本次连接");
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -70,13 +98,32 @@ fn is_loopback(addr: &str) -> bool {
     addr.starts_with("127.") || addr.starts_with("[::1]") || addr.starts_with("localhost:")
 }
 
+fn reject_overloaded(mut stream: TcpStream) {
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let _ = write_response(
+        &mut stream,
+        Response {
+            status: 503,
+            content_type: "application/json; charset=utf-8",
+            body: json!({"error": "连接数已达上限，请稍后重试"})
+                .to_string()
+                .into_bytes(),
+        },
+    );
+}
+
 fn handle_client(app: Arc<App>, mut stream: TcpStream, port: u16) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    // 单连接整体死线：防止逐字节慢放把线程占死。
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end;
     loop {
+        if Instant::now() > deadline {
+            bail!("请求整体超时");
+        }
         let n = stream.read(&mut tmp)?;
         if n == 0 {
             bail!("连接提前关闭");
@@ -112,6 +159,9 @@ fn handle_client(app: Arc<App>, mut stream: TcpStream, port: u16) -> Result<()> 
         bail!("请求体过大");
     }
     while buf.len() < header_end + content_length {
+        if Instant::now() > deadline {
+            bail!("请求体整体超时");
+        }
         let n = stream.read(&mut tmp)?;
         if n == 0 {
             break;
@@ -254,6 +304,7 @@ fn write_response(stream: &mut TcpStream, resp: Response) -> Result<()> {
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let head = format!(
