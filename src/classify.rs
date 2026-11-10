@@ -947,6 +947,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn optional_small_file_body_can_be_recorded() {
         let path = std::env::temp_dir().join(format!(
             "clipmon-file-{}-{}.txt",
