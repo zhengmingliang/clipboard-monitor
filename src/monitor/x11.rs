@@ -530,7 +530,9 @@ fn handle_write(
     job_tx: &Sender<Job>,
     ev: RawWrite,
 ) -> Result<()> {
-    bursts.remove(&ev.selection_name);
+    // 新写入关闭该选择区所有读突发；键带 xid_base 前缀，须按前缀整体清理。
+    let prefix = format!("{}:", ev.selection_name);
+    bursts.retain(|key, _| !key.starts_with(&prefix));
     let info = if ev.owner == 0 {
         AppInfo::unknown(0)
     } else if let Some(resolver) = resolver.as_mut() {
@@ -980,6 +982,55 @@ mod tests {
             let (_, total) = db.query_events(&EventFilter::default(), 10, 0).unwrap();
             assert_eq!(total, 1);
         }
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn new_write_closes_read_burst_window() {
+        let (app, dir) = test_app(Config::default());
+        let (job_tx, _job_rx) = mpsc::channel();
+        let mut resolver = None;
+        let mut bursts = HashMap::new();
+        let mk_read = |seq: u64, ms: i64| RawRead {
+            seq,
+            wall_ms: ms,
+            x_time: 0,
+            arrived: Instant::now(),
+            selection_name: "CLIPBOARD".into(),
+            selection_atom: 1,
+            requestor: 0x5600,
+            target_atom: 2,
+            xid_base: 0x3a0_0000,
+        };
+        handle_read(
+            &app,
+            &mut resolver,
+            &mut bursts,
+            mk_read(1, crate::now_ms()),
+        )
+        .unwrap();
+        handle_write(
+            &app,
+            &mut resolver,
+            &mut bursts,
+            &job_tx,
+            write_event(1, 999),
+        )
+        .unwrap();
+        assert!(bursts.is_empty(), "新写入应关闭全部读突发窗口");
+        handle_read(
+            &app,
+            &mut resolver,
+            &mut bursts,
+            mk_read(2, crate::now_ms() + 100),
+        )
+        .unwrap();
+        let db = app.db.lock().unwrap();
+        let (_, total) = db.query_events(&EventFilter::default(), 10, 0).unwrap();
+        drop(db);
+        // 写入 1 条 + 两次读取各 1 条；修复前第二次读取会合并进旧读取，总数只有 2。
+        assert_eq!(total, 3);
         drop(app);
         let _ = std::fs::remove_dir_all(dir);
     }
