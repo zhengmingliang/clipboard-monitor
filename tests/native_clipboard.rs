@@ -99,7 +99,7 @@ fn run_native_test() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         assert_eq!(meta["image"]["width"], 2);
         assert_eq!(meta["image"]["height"], 2);
-        assert_eq!(meta["image"]["mime"], "image/png");
+        assert_eq!(meta["image"]["mime"], "image/x-rgba");
         Ok::<(), Box<dyn std::error::Error>>(())
     })();
     if let Err(err) = result {

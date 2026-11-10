@@ -120,7 +120,6 @@ dependencies = [
  "fs2",
  "libc",
  "percent-encoding",
- "png",
  "rusqlite",
  "serde",
  "serde_json",

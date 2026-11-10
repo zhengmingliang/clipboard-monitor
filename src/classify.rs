@@ -53,6 +53,8 @@ pub struct FetchInput {
     pub image_mime: Option<String>,
     pub image_size: u64,
     pub image_header: Vec<u8>,
+    /// 已知像素宽高时直接给出，跳过文件头解析（Windows/macOS 的 RGBA 数据）。
+    pub image_dims: Option<(u32, u32)>,
     /// 能取得完整编码图片时提供 SHA-256；X11 流式抓取只提供文件头。
     pub image_sha256: Option<String>,
 }
@@ -109,7 +111,10 @@ pub fn assemble(input: &FetchInput, limits: &Limits) -> Captured {
         .map(|raw| parse_file_payload(raw, input.files_format.as_deref(), input.kde_cut))
         .unwrap_or_default();
     let image = input.image_mime.as_ref().map(|mime| {
-        let (w, h) = image_dimensions(mime, &input.image_header).unwrap_or((None, None));
+        let (w, h) = match input.image_dims {
+            Some((width, height)) => (Some(width), Some(height)),
+            None => image_dimensions(mime, &input.image_header).unwrap_or((None, None)),
+        };
         (mime.clone(), w, h, input.image_size)
     });
     let plain = input.plain.as_ref().map(|b| {

@@ -10,7 +10,6 @@ use crate::{log_debug, log_info, log_warn, now_ms};
 use anyhow::{bail, Context, Result};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use arboard::{Clipboard, Error as ClipboardError};
-use std::io::Cursor;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::sync::atomic::Ordering;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -19,6 +18,10 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::time::{Duration, Instant};
+
+/// 平台剪贴板解码出的原始像素；摘要直接对 RGBA 计算，不做二次编码。
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const NATIVE_IMAGE_MIME: &str = "image/x-rgba";
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(super) fn spawn(app: Arc<App>) -> Result<Vec<JoinHandle<()>>> {
@@ -81,12 +84,15 @@ fn capture_from(clipboard: &mut Clipboard, limits: &crate::classify::Limits) -> 
         Err(ClipboardError::ContentNotAvailable) => None,
         Err(err) => return Err(err).context("读取 Unicode 文本"),
     };
-    let png = match clipboard.get_image() {
-        Ok(image) => Some(encode_png(image.width, image.height, &image.bytes)?),
+    let image = match clipboard.get_image() {
+        Ok(image) => {
+            let (width, height) = validate_rgba(image.width, image.height, &image.bytes)?;
+            Some((width, height, image.bytes.into_owned()))
+        }
         Err(ClipboardError::ContentNotAvailable) => None,
         Err(err) => return Err(err).context("读取图片"),
     };
-    if plain.is_none() && png.is_none() {
+    if plain.is_none() && image.is_none() {
         return Ok(empty_capture());
     }
 
@@ -99,23 +105,24 @@ fn capture_from(clipboard: &mut Clipboard, limits: &crate::classify::Limits) -> 
     };
     if let Some(text) = &input.plain {
         input.target_names.push("text/plain".into());
-        if text.is_empty() && png.is_none() {
+        if text.is_empty() && image.is_none() {
             return Ok(empty_capture());
         }
     }
-    if let Some(png) = png {
-        input.target_names.push("image/png".into());
-        input.image_mime = Some("image/png".into());
-        input.image_size = png.len() as u64;
-        input.image_header = png.iter().copied().take(64).collect();
-        input.image_sha256 = Some(sha256_hex(&png));
+    if let Some((width, height, rgba)) = image {
+        input.target_names.push(NATIVE_IMAGE_MIME.into());
+        input.image_mime = Some(NATIVE_IMAGE_MIME.into());
+        input.image_size = rgba.len() as u64;
+        input.image_dims = Some((width, height));
+        input.image_sha256 = Some(rgba_sha256(width, height, &rgba));
     }
     Ok(assemble(&input, limits))
 }
 
-fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>> {
-    let width = u32::try_from(width).context("图片宽度超出 PNG 上限")?;
-    let height = u32::try_from(height).context("图片高度超出 PNG 上限")?;
+/// 校验系统返回的 RGBA 尺寸与长度是否自洽。
+fn validate_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<(u32, u32)> {
+    let width = u32::try_from(width).context("图片宽度超出上限")?;
+    let height = u32::try_from(height).context("图片高度超出上限")?;
     if width == 0 || height == 0 {
         bail!("系统返回了空图片");
     }
@@ -126,16 +133,16 @@ fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>> {
     if rgba.len() != expected {
         bail!("RGBA 数据长度 {} 与尺寸预期 {expected} 不符", rgba.len());
     }
-    let mut output = Cursor::new(Vec::new());
-    {
-        let mut encoder = png::Encoder::new(&mut output, width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().context("创建 PNG 编码器")?;
-        writer.write_image_data(rgba).context("编码剪贴板图片")?;
-        writer.finish().context("完成 PNG 编码")?;
-    }
-    Ok(output.into_inner())
+    Ok((width, height))
+}
+
+/// 宽高参与摘要，避免同字节不同尺寸被误判为同一内容。
+fn rgba_sha256(width: u32, height: u32, rgba: &[u8]) -> String {
+    let mut material = Vec::with_capacity(8 + rgba.len());
+    material.extend_from_slice(&width.to_le_bytes());
+    material.extend_from_slice(&height.to_le_bytes());
+    material.extend_from_slice(rgba);
+    sha256_hex(&material)
 }
 
 #[cfg(target_os = "macos")]
@@ -258,18 +265,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rgba_is_encoded_as_png_with_full_digest() {
-        let rgba = [
-            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
-        ];
-        let bytes = encode_png(2, 2, &rgba).expect("encode PNG");
-        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
-        assert_eq!(bytes[24], 8);
-        assert_ne!(sha256_hex(&bytes), sha256_hex(&bytes[..64]));
-    }
-
-    #[test]
-    fn invalid_rgba_length_is_rejected() {
-        assert!(encode_png(2, 2, &[0; 3]).is_err());
+    fn rgba_dims_are_validated_and_hashed() {
+        let rgba = [255u8, 0, 0, 255, 0, 255, 0, 255];
+        let (width, height) = validate_rgba(2, 1, &rgba).expect("合法尺寸");
+        assert_eq!((width, height), (2, 1));
+        assert!(validate_rgba(2, 1, &[0; 3]).is_err(), "长度不符应拒绝");
+        assert!(validate_rgba(0, 1, &[]).is_err(), "零尺寸应拒绝");
+        assert_ne!(
+            rgba_sha256(2, 1, &rgba),
+            rgba_sha256(1, 2, &rgba),
+            "同字节不同尺寸应有不同摘要"
+        );
     }
 }

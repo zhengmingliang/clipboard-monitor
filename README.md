@@ -6,13 +6,13 @@
 
 | 平台 | 变化检测 | 文本 | 图片 | 额外能力 |
 | --- | --- | --- | --- | --- |
-| Windows | `WM_CLIPBOARDUPDATE`，message-only 窗口 | Unicode 文本 | 系统图片转换为 PNG 元数据 | 完整内容摘要去重 |
-| macOS | 每 200ms 检查启停状态，最多每 2 秒做一次内容摘要采样 | Unicode 文本 | TIFF 等系统图片转换为 PNG 元数据 | 完整内容摘要去重、无窗口会话兼容 |
+| Windows | `WM_CLIPBOARDUPDATE`，message-only 窗口 | Unicode 文本 | 系统图片记录尺寸与完整摘要 | 完整内容摘要去重 |
+| macOS | 每 200ms 检查启停状态，最多每 2 秒做一次内容摘要采样 | Unicode 文本 | TIFF 等系统图片记录尺寸与完整摘要 | 完整内容摘要去重、无窗口会话兼容 |
 | Linux/X11 | XFixes 事件，空闲时不轮询内容 | 纯文本、富文本 | PNG/JPEG/GIF/WebP/BMP 等格式元数据 | PRIMARY、来源进程、ConvertSelection 读取审计 |
 
 Windows 和 macOS 不提供可靠的复制者进程归属及全局读取审计，因此界面会隐藏这些 X11 专属功能。原生 Wayland 客户端不在当前 Linux/X11 后端能力范围内；XWayland 上只能看到走 X11 的程序。
 
-图片只保存格式、尺寸、大小和摘要，不保存像素。Windows/macOS 上的 RGBA 图片会临时编码为 PNG 以取得尺寸和完整 SHA-256，随后丢弃编码字节。文本小于 1MB 时保存原文，达到 1MB 时只保存大小、摘要和前 4KB。文件列表和文件内容保存规则目前适用于 Linux/X11。
+图片只保存格式、尺寸、大小和摘要，不保存像素。Windows/macOS 直接对剪贴板解码出的 RGBA 像素计算完整 SHA-256（宽高参与摘要），不做二次编码。文本小于 1MB 时保存原文，达到 1MB 时只保存大小、摘要和前 4KB。文件列表和文件内容保存规则目前适用于 Linux/X11。
 
 ## 构建
 
