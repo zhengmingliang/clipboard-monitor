@@ -66,7 +66,8 @@ pub struct App {
 
 #[derive(Clone)]
 pub(crate) struct Snap {
-    content_id: i64,
+    /// 关联的 contents 行。白名单程序的内容不入库，这里为 None。
+    content_id: Option<i64>,
     #[cfg(target_os = "linux")]
     event_id: Option<i64>,
     #[cfg(target_os = "linux")]
@@ -137,7 +138,7 @@ impl App {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .map(|s| s.content_id)
+            .filter_map(|s| s.content_id)
             .collect()
     }
 
@@ -209,7 +210,7 @@ impl App {
         self.snaps.lock().unwrap_or_else(|e| e.into_inner()).insert(
             "CLIPBOARD".into(),
             Snap {
-                content_id,
+                content_id: Some(content_id),
                 #[cfg(target_os = "linux")]
                 event_id: Some(event_id),
                 #[cfg(target_os = "linux")]

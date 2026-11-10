@@ -565,9 +565,15 @@ fn handle_write(
     } else {
         Captured::placeholder("内容获取中")
     };
+    // 白名单程序只留一条"内容未记录"的快照占位，不插内容行、不下发抓取，
+    // 保证剪贴板正文完全不落盘。
     let (content_id, event_id) = {
         let db = app.db.lock().unwrap_or_else(|e| e.into_inner());
-        let id = db.insert_content(&placeholder, ev.wall_ms)?;
+        let id = if whitelisted {
+            None
+        } else {
+            Some(db.insert_content(&placeholder, ev.wall_ms)?)
+        };
         let event_id = if whitelisted {
             None
         } else {
@@ -580,7 +586,7 @@ fn handle_write(
                 wm_class: info.wm_class.clone(),
                 exec_path: info.exec_path.clone(),
                 window_id: ev.owner,
-                content_id: Some(id),
+                content_id: id,
                 content_type: placeholder.content_type.clone(),
                 content_size: placeholder.size,
                 summary: placeholder.summary.clone(),
@@ -607,7 +613,11 @@ fn handle_write(
                 source_app: info.app_name.clone(),
                 source_pid: info.pid,
                 owner: ev.owner,
-                summary: placeholder.summary.clone(),
+                summary: if whitelisted {
+                    "内容未记录".to_string()
+                } else {
+                    placeholder.summary.clone()
+                },
                 content_type: placeholder.content_type,
                 size: 0,
                 truncated: false,
@@ -615,14 +625,16 @@ fn handle_write(
             },
         );
     }
-    if ev.owner != 0 {
-        let _ = job_tx.send(Job::Fetch(FetchJob {
-            selection: ev.selection_atom,
-            selection_name: ev.selection_name,
-            owner: ev.owner,
-            content_id,
-            limits,
-        }));
+    if ev.owner != 0 && !whitelisted {
+        if let Some(cid) = content_id {
+            let _ = job_tx.send(Job::Fetch(FetchJob {
+                selection: ev.selection_atom,
+                selection_name: ev.selection_name,
+                owner: ev.owner,
+                content_id: cid,
+                limits,
+            }));
+        }
     }
     Ok(())
 }
@@ -681,7 +693,7 @@ fn handle_read(
                     .map(|s| s.content_type.as_str())
                     .unwrap_or("custom"),
                 snap.as_ref().map(|s| s.size).unwrap_or(0),
-                snap.as_ref().map(|s| s.content_id),
+                snap.as_ref().and_then(|s| s.content_id),
                 snap.as_ref().map(|s| s.source_app.as_str()).unwrap_or(""),
                 snap.as_ref().and_then(|s| s.source_pid),
                 snap.as_ref().and_then(|s| s.event_id),
@@ -702,7 +714,7 @@ fn handle_read(
         wm_class: info.wm_class,
         exec_path: info.exec_path,
         window_id: ev.requestor,
-        content_id: snap.as_ref().map(|s| s.content_id),
+        content_id: snap.as_ref().and_then(|s| s.content_id),
         content_type: snap
             .as_ref()
             .map(|s| s.content_type.clone())
@@ -767,7 +779,7 @@ fn apply_fetch(app: &App, done: FetchDone) {
     drop(db);
     let mut snaps = app.snaps.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(snap) = snaps.get_mut(&done.selection_name) {
-        if snap.content_id == done.content_id {
+        if snap.content_id == Some(done.content_id) {
             snap.summary = done.captured.summary;
             snap.content_type = done.captured.content_type;
             snap.size = done.captured.size;
@@ -873,4 +885,102 @@ fn connect_fetch() -> Result<FetchState> {
 
 fn intern_pid(conn: &XConn) -> Result<u32> {
     x11util::intern(conn, "_NET_WM_PID")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::db::{Database, EventFilter};
+
+    fn test_app(cfg: Config) -> (Arc<App>, std::path::PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "clipmon-x11-test-{}-{}-{}",
+            std::process::id(),
+            crate::now_ms(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open(&dir.join("monitor.db")).unwrap();
+        let app = App::new(db, cfg, dir.join("config.json"));
+        (app, dir)
+    }
+
+    fn write_event(seq: u64, owner: u32) -> RawWrite {
+        RawWrite {
+            seq,
+            wall_ms: crate::now_ms(),
+            x_time: 0,
+            arrived: Instant::now(),
+            selection_name: "CLIPBOARD".into(),
+            selection_atom: 1,
+            owner,
+            reason: "owner_change",
+        }
+    }
+
+    #[test]
+    fn whitelisted_write_keeps_content_out_of_db() {
+        let cfg = Config {
+            whitelist: vec!["window-123".to_string()],
+            ..Default::default()
+        };
+        let (app, dir) = test_app(cfg);
+        let (job_tx, job_rx) = mpsc::channel();
+        let mut resolver = None;
+        let mut bursts = HashMap::new();
+        handle_write(
+            &app,
+            &mut resolver,
+            &mut bursts,
+            &job_tx,
+            write_event(1, 123),
+        )
+        .unwrap();
+        assert!(
+            job_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "白名单程序不应触发内容抓取"
+        );
+        {
+            let db = app.db.lock().unwrap();
+            assert_eq!(db.stats().unwrap().contents, 0, "正文不应落盘");
+            let (_, total) = db.query_events(&EventFilter::default(), 10, 0).unwrap();
+            assert_eq!(total, 0, "白名单写入不应生成事件");
+        }
+        assert!(app.keep_content_ids().is_empty());
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn normal_write_still_fetches_and_records() {
+        let (app, dir) = test_app(Config::default());
+        let (job_tx, job_rx) = mpsc::channel();
+        let mut resolver = None;
+        let mut bursts = HashMap::new();
+        handle_write(
+            &app,
+            &mut resolver,
+            &mut bursts,
+            &job_tx,
+            write_event(1, 456),
+        )
+        .unwrap();
+        match job_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("普通写入应有抓取任务")
+        {
+            Job::Fetch(f) => assert_eq!(f.owner, 456),
+            Job::Stop => panic!("不应收到停止指令"),
+        }
+        {
+            let db = app.db.lock().unwrap();
+            assert_eq!(db.stats().unwrap().contents, 1);
+            let (_, total) = db.query_events(&EventFilter::default(), 10, 0).unwrap();
+            assert_eq!(total, 1);
+        }
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
