@@ -9,7 +9,7 @@ use clipboard_monitor::config::{
 use clipboard_monitor::db::{CleanupSpec, Database};
 use clipboard_monitor::http_server;
 use clipboard_monitor::monitor::{self, App};
-use clipboard_monitor::{init_log, log_info, now_ms};
+use clipboard_monitor::{init_log, log_info};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -293,7 +293,6 @@ fn cleanup_cli(opt: &Opt) -> Result<()> {
     };
     let n = db.cleanup(&spec)?;
     println!("已删除 {n} 条");
-    let _ = now_ms();
     Ok(())
 }
 

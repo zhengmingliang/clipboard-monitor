@@ -5,7 +5,7 @@ use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, Window, WindowClass,
+    Atom, ConnectionExt as _, CreateWindowAux, EventMask, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 
@@ -83,10 +83,6 @@ pub fn create_helper_window(conn: &XConn, screen: usize) -> Result<Window> {
     Ok(window)
 }
 
-pub fn atom_eq_primary() -> Atom {
-    AtomEnum::PRIMARY.into()
-}
-
 pub fn poll_event_timeout(
     conn: &XConn,
     fd: i32,
@@ -106,11 +102,6 @@ pub fn poll_event_timeout(
             return Ok(None);
         }
     }
-}
-
-pub fn remaining_ms(deadline: Instant) -> i32 {
-    let left = deadline.saturating_duration_since(Instant::now());
-    left.as_millis().min(i32::MAX as u128) as i32
 }
 
 pub fn timeout_after(ms: u64) -> Instant {

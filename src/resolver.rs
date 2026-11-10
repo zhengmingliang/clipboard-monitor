@@ -4,7 +4,6 @@ use crate::x11util::{intern, XConn};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
 use std::time::{Duration, Instant};
 use x11rb::connection::RequestConnection;
 use x11rb::protocol::res::{ClientIdMask, ClientIdSpec, ConnectionExt as ResExt};
@@ -292,7 +291,6 @@ impl Resolver {
                 at: Instant::now(),
             },
         );
-        let _ = Path::new(&exe);
         (comm, exe)
     }
 }

@@ -363,7 +363,7 @@ fn read_property(
         )?
         .reply()
         .context("GetProperty")?;
-    if first.type_ == incr_atom || first.type_ == intern_incr_fallback(first.type_, incr_atom) {
+    if first.type_ == incr_atom {
         return read_incr(conn, fd, window, property, full_limit, preview, deadline);
     }
     let total = first.value.len() as u64 + u64::from(first.bytes_after);
@@ -400,15 +400,6 @@ fn read_property(
         }
     }
     Ok(BytesOut { bytes, total })
-}
-
-fn intern_incr_fallback(actual: Atom, incr: Atom) -> Atom {
-    // 占位，避免把普通类型误判成 INCR。调用方已经用 incr_atom 比较。
-    if actual == incr {
-        incr
-    } else {
-        Atom::MAX
-    }
 }
 
 fn read_incr(
