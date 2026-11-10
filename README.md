@@ -50,7 +50,9 @@ SQLite 编进可执行文件，不需要单独安装数据库。Windows 发布�
 ./target/release/clipboard-monitor serve
 ```
 
-不写子命令时等同于 `serve`。浏览器打开 <http://127.0.0.1:27890>，可以开关监控、按时间/类型筛选和清理日志。
+不写子命令时等同于 `serve`。浏览器打开 <http://127.0.0.1:27890>，可以开关监控、按时间/类型筛选、全文搜索和清理日志。
+
+打开任意一条有完整文本正文的记录，点「恢复到剪贴板」即可把历史内容重新写回系统剪贴板（`POST /api/events/{id}/restore`）。Windows/macOS 与 Linux 的 X11/Wayland 都走 arboard 的 `set_text`；X11/Wayland 下剪贴板所有权需要后台线程持续应答读取请求，因此监控进程会长期持有同一个剪贴板上下文，直到进程退出。**截断内容、只有摘要的记录和图片都不回写**（本项目不保存像素），接口会明确报错而不是写入不完整内容。恢复动作本身是一次真实的剪贴板写入，会被后端照常记录。
 
 ```bash
 ./target/release/clipboard-monitor status

@@ -75,6 +75,8 @@ pub struct App {
     pub changes_ok: AtomicBool,
     pub record_ok: AtomicBool,
     pub xfixes_ok: AtomicBool,
+    /// 长期持有的剪贴板上下文，供"恢复到剪贴板"使用。
+    pub restore: crate::restore::RestoreManager,
     snaps: Mutex<HashMap<String, Snap>>,
     #[cfg(target_os = "linux")]
     clients: RwLock<Vec<crate::x11util::ClientRange>>,
@@ -126,6 +128,7 @@ impl App {
             changes_ok: AtomicBool::new(false),
             record_ok: AtomicBool::new(false),
             xfixes_ok: AtomicBool::new(false),
+            restore: crate::restore::RestoreManager::new(),
             snaps: Mutex::new(HashMap::new()),
             #[cfg(target_os = "linux")]
             clients: RwLock::new(Vec::new()),

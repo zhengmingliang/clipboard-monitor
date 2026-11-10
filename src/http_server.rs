@@ -375,6 +375,34 @@ fn dispatch(app: &App, method: &str, path: &str, query: &str, body: &[u8]) -> Re
         return Ok(json_ok(serde_json::to_value(cfg)?));
     }
     if let Some(id) = path.strip_prefix("/api/events/") {
+        if let Some(id) = id.strip_suffix("/restore") {
+            if method != "POST" {
+                bail!("恢复到剪贴板只支持 POST");
+            }
+            let id: i64 = id.parse().map_err(|_| anyhow!("事件不存在"))?;
+            let detail = {
+                let db = app.db.lock().unwrap_or_else(|e| e.into_inner());
+                db.get_event(id)?.ok_or_else(|| anyhow!("事件不存在"))?
+            };
+            match crate::restore::parse_restorable(
+                detail.body.as_deref(),
+                detail.meta_json.as_deref(),
+                &detail.event.content_type,
+                detail.event.truncated,
+                detail.has_blob,
+            ) {
+                crate::restore::Restorable::Text(text) => {
+                    app.restore.restore_text(&text)?;
+                }
+                crate::restore::Restorable::Image(w, h, rgba) => {
+                    app.restore.restore_image(w, h, rgba)?;
+                }
+                crate::restore::Restorable::None => {
+                    bail!("这条记录没有可恢复的完整正文（截断内容或图片不保存像素）");
+                }
+            }
+            return Ok(json_ok(json!({"restored": true, "id": id})));
+        }
         if let Some(id) = id.strip_suffix("/file") {
             if method != "GET" {
                 bail!("方法不支持");

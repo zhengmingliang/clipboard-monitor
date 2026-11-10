@@ -15,6 +15,7 @@ pub mod http_server;
 pub mod monitor;
 #[cfg(target_os = "linux")]
 pub mod resolver;
+pub mod restore;
 #[cfg(target_os = "linux")]
 pub mod x11util;
 #[cfg(target_os = "linux")]

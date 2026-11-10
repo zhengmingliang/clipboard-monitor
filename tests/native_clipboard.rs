@@ -158,6 +158,13 @@ fn run_native_test() -> Result<(), Box<dyn std::error::Error>> {
                 "清空应带 cleared 语义"
             );
         }
+
+        // 回写（放在所有内容断言之后，避免新产生的写入干扰去重/清空断言）：
+        // 把历史文本记录重新写回系统剪贴板，并读回校验。
+        let restore_id = text_event["id"].as_i64().ok_or("文本事件没有 ID")?;
+        let restored = post_json(&format!("{base}/api/events/{restore_id}/restore"), "{}")?;
+        assert_eq!(restored["restored"], true, "回写接口应返回 restored=true");
+        assert_eq!(clipboard.get_text()?, token, "系统剪贴板应恢复成历史正文");
         Ok::<(), Box<dyn std::error::Error>>(())
     })();
 
@@ -329,6 +336,27 @@ fn wait_event(
         return Err(format!("等待剪贴板事件超时，最后一次 HTTP 错误: {err}").into());
     }
     Err("等待目标剪贴板事件超时".into())
+}
+
+/// 写接口需要 Content-Type: application/json（同源校验由浏览器头保证，
+/// 这里直连回环地址不带 Origin，服务端按同源放行）。
+fn post_json(url: &str, body: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    let rest = url.trim_start_matches("http://");
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let mut stream = std::net::TcpStream::connect(host)?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    write!(
+        stream,
+        "POST /{path} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|parts| parts.1)
+        .ok_or("HTTP 响应没有正文")?;
+    Ok(serde_json::from_str(body)?)
 }
 
 fn get_json(url: &str) -> Result<Value, Box<dyn std::error::Error>> {

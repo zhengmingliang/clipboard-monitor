@@ -303,10 +303,12 @@
       </ul>
       <h2>加密与搜索</h2>
       <p>剪贴板正文（文本、图片、元数据、摘要）用 AES-256-GCM 加密后落库，密钥由 Windows DPAPI / macOS Keychain / Linux 数据目录里的 0600 文件保管。时间、类型、应用名等列仍明文以便筛选。<strong>备份数据目录时必须连同密钥一起复制</strong>，否则数据库无法解密。搜索框由 FTS5 全文索引驱动，支持中文子串；索引的是解密后的明文，密文不会写进索引。</p>
+      <h2>恢复历史内容</h2>
+      <p>打开一条有完整文本正文的记录，点「恢复到剪贴板」即可重新写回系统剪贴板直接粘贴。截断内容、只有摘要的记录和图片不可回写（不保存像素），按钮会禁用并提示。恢复本身是一次真实写入，会被照常记录。</p>
       <h2>怎么停</h2>
       <p>页面上的开关只暂停记录，进程还在。命令行 <code>clipboard-monitor stop</code> 会退出进程。</p>
       <h2>限制</h2>
-      <p>图片只保存格式、尺寸和大小，不保存像素。Linux 原生 Wayland 客户端不在当前 X11 后端能力范围内；macOS 每 200ms 检查启停状态、最多每 2 秒做一次内容摘要采样，Windows 由系统消息触发。macOS 14+ 的隐私提示可能要求用户允许本程序访问剪贴板。</p>
+      <p>图片只保存格式、尺寸和大小，不保存像素。Linux 会自动选择 X11 或 Wayland 后端（Wayland 下无读取审计与来源进程）；macOS 每 200ms 检查启停状态、最多每 2 秒做一次内容摘要采样，Windows 由系统消息触发。macOS 14+ 的隐私提示可能要求用户允许本程序访问剪贴板。</p>
     </div>
   </section>
 </main>
@@ -549,12 +551,34 @@ async function showDetail(id, tr) {
       <span>校验</span><div class="hash">${escapeHtml(ev.sha256 || "")}</div>
     </div>
     ${extra}${body}${blob}
+    <p><button type="button" id="restore-clip" ${ev.body ? "" : "disabled title='没有可恢复的完整正文'"}>恢复到剪贴板</button>
+       <span id="restore-msg" class="note"></span></p>
     ${e.pid ? `<p><button type="button" id="add-pid">按 PID ${e.pid} 加入白名单</button></p>` : ""}`;
   const add = $("add-pid");
   if (add) {
     add.onclick = () => addPidToWhitelist(e.pid).catch(err => {
-      add.insertAdjacentHTML("afterend", `<span class="note err"> ${escapeHtml(err.message)}</span>`);
+      add.insertAdjacentHTML("afterend", `<span class="note err"> ${escapeHtml(err.message)}</span>");
     });
+  }
+  const restore = $("restore-clip");
+  if (restore) {
+    restore.onclick = async () => {
+      restore.disabled = true;
+      const msg = $("restore-msg");
+      msg.textContent = "正在写入系统剪贴板…";
+      try {
+        await api(`/api/events/${e.id}/restore`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}"
+        });
+        msg.textContent = "已恢复，可直接粘贴";
+      } catch (err) {
+        msg.textContent = `恢复失败：${err.message}`;
+      } finally {
+        restore.disabled = false;
+      }
+    };
   }
 }
 
