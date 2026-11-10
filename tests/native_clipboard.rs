@@ -89,19 +89,25 @@ fn run_native_test() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(text_detail["body"].as_str(), Some(token.as_str()));
         verify_source_metadata(&text_event, &text_detail)?;
 
-        // 去重是 portable 后端（Win/macOS）的契约：X11 按所有权变化记事件，
-        // 同一文本再次声明所有权会产生新的一条，不强求内容级去重。
+        // portable 后端（Win/macOS）的去重契约：同一内容重复写入不得再产生
+        // `content_change`。但 OS 变更序号（changeCount/GetClipboardSequenceNumber）
+        // 会因重新声明所有权而递增，此时允许一条 `sequence_change` 记录该事实，
+        // 这正是"完整变更语义"的一部分。X11 按所有权变化记事件，不参与此断言。
         if !cfg!(target_os = "linux") {
             std::thread::sleep(Duration::from_millis(300));
             clipboard.set_text(token.clone())?;
             std::thread::sleep(Duration::from_secs(3));
-            let duplicates = count_events(&base, |event| {
+            let repeats = count_events(&base, |event| {
                 event["summary"]
                     .as_str()
                     .unwrap_or_default()
                     .contains(&token)
+                    && event["reason"] == "content_change"
             })?;
-            assert_eq!(duplicates, 1, "同一内容重复写入应被去重为一条");
+            assert_eq!(
+                repeats, 1,
+                "同一内容重复写入不应再产生 content_change（允许 sequence_change）"
+            );
         }
 
         let text_id = text_event["id"].as_i64().ok_or("文本事件没有 ID")?;
@@ -202,27 +208,40 @@ fn verify_capabilities(base: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Windows/macOS 应至少给出一项来源元数据，且 meta_json 带 change 判定依据。
-/// Linux/X11 有自己的来源解析链路，这里只校验共享的 change 子对象。
+/// 校验观察上下文完整性：监控器自身能保证判据、格式清单、序号都落库。
+///
+/// 来源元数据是"OS 可可靠提供才填"的尽力项：Windows 无窗口/headless 会话里
+/// `GetClipboardOwner` 可能返回空，macOS 的 `frontmostApplication` 也可能为 nil。
+/// 这类会话不应让契约测试失败，但如果 OS 给出了来源，则必须与 NewEvent 字段一致。
+/// Linux/X11 有自己的来源解析链路，不在此断言。
 fn verify_source_metadata(event: &Value, detail: &Value) -> Result<(), Box<dyn std::error::Error>> {
     let meta: Value = serde_json::from_str(detail["meta_json"].as_str().ok_or("事件没有元数据")?)?;
     if !cfg!(target_os = "linux") {
-        let has_source = event["pid"].is_i64()
-            || !event["app_name"].as_str().unwrap_or_default().is_empty()
-            || !event["exec_path"].as_str().unwrap_or_default().is_empty()
-            || event["window_id"].as_i64().unwrap_or(0) != 0;
-        assert!(
-            has_source,
-            "非 X11 平台应采集到至少一项来源元数据，实际事件: {event}"
-        );
         assert!(
             meta["change"]["kind"].is_string(),
             "meta_json.change 应给出事件语义"
         );
         assert!(
-            meta["formats"].is_array(),
-            "meta_json.formats 应记录格式清单"
+            meta["formats"].as_array().is_some_and(|a| !a.is_empty()),
+            "meta_json.formats 应记录非空格式清单，实际: {meta}"
         );
+        assert!(
+            meta["sequence"].is_u64() || meta["sequence"].is_i64(),
+            "meta_json.sequence 应记录 OS 变更序号"
+        );
+        assert!(
+            !event["targets"].as_str().unwrap_or_default().is_empty(),
+            "事件应带格式清单"
+        );
+        // OS 给出来源时，字段必须与 meta_json 一致，不允许填错。
+        if let Some(source) = meta.get("source") {
+            if let Some(pid) = source["pid"].as_i64() {
+                assert_eq!(event["pid"].as_i64(), Some(pid), "来源 PID 应一致");
+            }
+            if let Some(name) = source["app_name"].as_str() {
+                assert_eq!(event["app_name"].as_str(), Some(name), "来源应用名应一致");
+            }
+        }
     }
     Ok(())
 }

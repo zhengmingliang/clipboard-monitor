@@ -515,6 +515,13 @@ async function showDetail(id, tr) {
   const blob = ev.has_blob ? `<p><a href="/api/events/${e.id}/file">下载记录的文件内容</a></p>` : "";
   const trigger = meta.trigger || {};
   const change = meta.change || {};
+  const source = meta.source || {};
+  const attributionNames = {
+    clipboard_owner: "剪贴板所有者窗口", foreground_fallback: "前台应用（无所有者窗口时回退）",
+    frontmost_app: "前台应用", unavailable: "当前会话无法取得",
+  };
+  const attributionNote = source.attribution
+    ? `<span>归属方式</span><div>${escapeHtml(attributionNames[source.attribution] || source.attribution)}${source.reason ? " · " + escapeHtml(source.reason) : ""}</div>` : "";
   const triggerNote = trigger.app_name || trigger.window_title
     ? `<span>触发主体</span><div>${escapeHtml(trigger.app_name || "")}${trigger.pid ? " (pid " + trigger.pid + ")" : ""}${trigger.window_title ? " · " + escapeHtml(trigger.window_title) : ""}</div>` : "";
   const inferredNote = change.inferred
@@ -529,7 +536,7 @@ async function showDetail(id, tr) {
       <span>路径</span><div>${escapeHtml(e.exec_path || "")}</div>
       <span>窗口类</span><div>${escapeHtml(e.wm_class || "")}</div>
       <span>来源</span><div>${escapeHtml(e.source_app || "")} ${e.source_pid ? "(pid " + e.source_pid + ")" : ""}</div>
-      ${triggerNote}
+      ${attributionNote}${triggerNote}
       <span>类型</span><div>${typeName[e.content_type] || escapeHtml(e.content_type || "")}${e.truncated ? " · 已截断" : ""}</div>
       <span>大小</span><div>${human(e.content_size)}</div>
       <span>格式</span><div>${targetChips(e.targets)}</div>

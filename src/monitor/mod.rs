@@ -260,6 +260,14 @@ impl App {
                 "app_name": source.app_name,
                 "exec_path": source.exec_path,
                 "window_id": source.window_id,
+                "attribution": obs.source_attribution,
+            });
+        } else {
+            // OS 无法给出归属时也要留下"为何缺失"的上下文，而不是让字段
+            // 静默消失；保留后端给出的 attribution，只补原因说明。
+            meta["source"] = serde_json::json!({
+                "attribution": obs.source_attribution.clone().unwrap_or_else(|| "unavailable".into()),
+                "reason": "当前会话无法取得剪贴板所有者或前台应用",
             });
         }
         if trigger.has_any() {

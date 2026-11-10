@@ -268,8 +268,8 @@ fn read_target_list(
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    for chunk in data.bytes.chunks_exact(4) {
-        let atom = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for chunk in data.bytes.as_chunks::<4>().0 {
+        let atom = u32::from_ne_bytes(*chunk);
         if atom != 0 {
             out.push(atom);
         }
@@ -452,8 +452,10 @@ fn read_incr(
 
 fn decode_moz(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     let text = String::from_utf16_lossy(&units);
     text.replace('\u{0}', "\n")

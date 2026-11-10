@@ -193,7 +193,9 @@ fn decorate_observation(obs: &mut ClipboardObservation, inferred_read: bool) {
         if !formats.is_empty() {
             obs.formats = formats;
         }
-        obs.source = crate::monitor::win32::clipboard_source();
+        let (source, attribution) = crate::monitor::win32::clipboard_source();
+        obs.source = source;
+        obs.source_attribution = Some(attribution.to_string());
         obs.trigger = crate::monitor::win32::foreground_trigger();
         // Windows 是唯一能间接推断读取的平台：序号没变却收到变更通知，
         // 说明某个客户端触发了延迟渲染。仅此一处允许置位。
@@ -207,6 +209,7 @@ fn decorate_observation(obs: &mut ClipboardObservation, inferred_read: bool) {
             obs.formats = formats;
         }
         obs.source = crate::monitor::macos::foreground_app();
+        obs.source_attribution = Some("frontmost_app".to_string());
         obs.trigger = crate::monitor::macos::foreground_trigger();
         // macOS 没有任何读取信号，永不产生推断读取。
         obs.inferred_read = false;

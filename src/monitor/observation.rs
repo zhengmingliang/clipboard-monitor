@@ -57,6 +57,9 @@ pub struct ClipboardObservation {
     /// 共享 `classify::assemble` 的产出（含 sha256）。
     pub body: Captured,
     pub source: Option<SourceInfo>,
+    /// 来源归属方式（`clipboard_owner` / `foreground_fallback` /
+    /// `frontmost_app`），写进 meta_json 以免把回退值当成所有者。
+    pub source_attribution: Option<String>,
     pub trigger: Option<TriggerInfo>,
     pub is_empty: bool,
     /// 该次通知是否疑似"读取触发的延迟渲染"，仅 Windows 会置 true。
@@ -71,6 +74,7 @@ impl ClipboardObservation {
             sequence: None,
             body,
             source: None,
+            source_attribution: None,
             trigger: None,
             is_empty: false,
             inferred_read: false,

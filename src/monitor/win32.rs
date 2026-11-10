@@ -50,19 +50,40 @@ pub fn clipboard_formats() -> Vec<String> {
 ///
 /// 注意：延迟渲染下 `GetClipboardOwner` 返回的是"声明所有权"的窗口，
 /// 不一定是发起复制的线程；这是 OS 能给出的最可靠归属，不做过度推断。
-pub fn clipboard_source() -> Option<SourceInfo> {
+///
+/// 无窗口/headless 会话里剪贴板可能没有所有者窗口（例如复制方进程已退出
+/// 或直接以 NULL 所有者调用 OpenClipboard）。此时回退到前台窗口的进程，
+/// 让记录至少带上"动作发生时的前台应用"这一上下文；调用方通过
+/// `attribution` 标注区分两种来源，不把回退值冒充剪贴板所有者。
+/// 返回（来源信息，归属方式）。归属方式写进 `meta_json.source.attribution`，
+/// 避免把回退值当成剪贴板所有者。两件事在同一次 `GetClipboardOwner` 调用里
+/// 判定，防止两次调用之间所有者变化导致标注与数据不一致。
+pub fn clipboard_source() -> (Option<SourceInfo>, &'static str) {
     let owner: HWND = unsafe { GetClipboardOwner() };
-    if owner.is_null() {
-        return None;
+    let (hwnd, attribution) = if owner.is_null() {
+        (unsafe { GetForegroundWindow() }, "foreground_fallback")
+    } else {
+        (owner, "clipboard_owner")
+    };
+    if hwnd.is_null() {
+        return (None, "unavailable");
     }
-    let window_id = owner as usize as u32;
+    // 只有真正的所有者窗口才写 window_id；回退时不填，避免误导。
+    let window_id = if owner.is_null() {
+        0
+    } else {
+        owner as usize as u32
+    };
     let mut pid: u32 = 0;
-    unsafe { GetWindowThreadProcessId(owner, &mut pid) };
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
     if pid == 0 {
-        return Some(SourceInfo {
-            window_id,
-            ..Default::default()
-        });
+        return (
+            Some(SourceInfo {
+                window_id,
+                ..Default::default()
+            }),
+            attribution,
+        );
     }
     let path = process_image_path(pid);
     let app_name = path
@@ -70,14 +91,17 @@ pub fn clipboard_source() -> Option<SourceInfo> {
         .and_then(|p| p.file_stem())
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    Some(SourceInfo {
-        pid: Some(pid as i32),
-        app_name,
-        exec_path: path
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        window_id,
-    })
+    (
+        Some(SourceInfo {
+            pid: Some(pid as i32),
+            app_name,
+            exec_path: path
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            window_id,
+        }),
+        attribution,
+    )
 }
 
 /// 前台窗口/应用（触发主体）。与内容生产者可能不同，单列以免混淆。

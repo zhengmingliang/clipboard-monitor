@@ -14,7 +14,7 @@
 
 **读取能力的诚实边界**：只有 Linux/X11 能通过 RECORD 拦截 `ConvertSelection`，得到可靠的全局读取审计（`capabilities.reads=true`）。Windows 的 `capabilities.reads_inferred=true` 只表示"变更序号没变却收到变更通知"这种间接信号，事件标为 `op=read` + `reason=inferred_read` + `meta_json.change.inferred=true`，界面显示"推断读取"，**不冒充可靠审计**；macOS 不产生任何读取事件。界面据此隐藏/放开"读取"筛选与流转链。
 
-**元数据（OS 可可靠提供的全部）**：Windows 采集 `GetClipboardOwner` → `GetWindowThreadProcessId` → `QueryFullProcessImageNameW`（写入者 PID / 应用名 / 可执行路径 / 窗口句柄），以及 `GetForegroundWindow` + `GetWindowTextW`（触发主体）；macOS 采集 `NSWorkspace.frontmostApplication` + `proc_pidpath`（前台应用 PID / 名称 / bundle id / 路径）。`wm_class` 是 X11 概念，Windows/macOS 恒为空；`window_id` 在 macOS 没有对应概念，恒为 0。无法可靠获取的字段显式留空，不填误导性数值。来源与触发主体另外写进 `meta_json.source` / `meta_json.trigger`，详情页展示。
+**元数据（OS 可可靠提供的全部）**：Windows 采集 `GetClipboardOwner` → `GetWindowThreadProcessId` → `QueryFullProcessImageNameW`（写入者 PID / 应用名 / 可执行路径 / 窗口句柄），以及 `GetForegroundWindow` + `GetWindowTextW`（触发主体）；macOS 采集 `NSWorkspace.frontmostApplication` + `proc_pidpath`（前台应用 PID / 名称 / bundle id / 路径）。无窗口/headless 会话里若剪贴板没有所有者窗口，Windows 会回退到前台应用并在 `meta_json.source.attribution` 标为 `foreground_fallback`（`window_id` 留 0，不冒充所有者）；两者都取不到时标 `unavailable` 并写明原因，保证每条记录都能解释自己的元数据完整度，绝不填误导性数值。`wm_class` 是 X11 概念，Windows/macOS 恒为空；`window_id` 在 macOS 没有对应概念，恒为 0。来源与触发主体另外写进 `meta_json.source` / `meta_json.trigger`，详情页展示归属方式。
 
 **白名单三平台生效**：命中白名单的程序，其剪贴板正文零落盘（不产生 contents / events 行），与 Linux/X11 行为一致。`wm_class` 匹配只在 X11 有意义，其它平台按进程名、可执行文件名/全路径、PID 匹配。
 
