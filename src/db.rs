@@ -317,6 +317,74 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// 一条变化记录（contents + events）在同一个事务里落库。
+    ///
+    /// Windows/macOS 后端在通知到达时同步持有完整内容，不需要 X11 的
+    /// "先插占位、再异步回填"。拆成两次独立 execute 时，events 插入失败会
+    /// 留下孤儿 contents，且重试会重复插入。事务化后两者同时成功或同时回滚。
+    pub fn insert_change(
+        &mut self,
+        cap: &Captured,
+        ev: &NewEvent,
+        ts_ms: i64,
+    ) -> Result<(i64, i64)> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO contents (sha256, content_type, size_bytes, truncated, body, blob, meta_json, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                cap.sha256,
+                cap.content_type,
+                cap.size as i64,
+                cap.truncated as i32,
+                cap.body,
+                cap.blob,
+                cap.meta_json,
+                ts_ms,
+            ],
+        )?;
+        let content_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO events (
+                ts_ms, op, selection, pid, app_name, wm_class, exec_path, window_id,
+                content_id, content_type, content_size, summary, targets,
+                source_app, source_pid, source_event_id, truncated, x_time, reason, created_ms,
+                pending
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                ?21
+             )",
+            params![
+                ev.ts_ms,
+                ev.op,
+                ev.selection,
+                ev.pid,
+                ev.app_name,
+                ev.wm_class,
+                ev.exec_path,
+                ev.window_id as i64,
+                content_id,
+                ev.content_type,
+                ev.content_size as i64,
+                ev.summary,
+                ev.targets,
+                ev.source_app,
+                ev.source_pid,
+                ev.source_event_id,
+                ev.truncated as i32,
+                ev.x_time as i64,
+                ev.reason,
+                ev.ts_ms,
+                ev.pending as i32,
+            ],
+        )?;
+        let event_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok((content_id, event_id))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn update_read_burst(
         &self,
@@ -1206,5 +1274,107 @@ mod tests {
         );
         assert_eq!(download_filename("{}", "gedit"), "gedit");
         assert_eq!(download_filename("not json", ""), "file");
+    }
+
+    #[test]
+    fn insert_change_writes_content_and_event_atomically() {
+        let (mut db, path) = tmp_db();
+        let cap = assemble(
+            &FetchInput {
+                target_names: vec!["text/plain".into(), "text/html".into()],
+                plain: Some(b"cross-platform".to_vec()),
+                plain_total: 14,
+                plain_mime: Some("text/plain".into()),
+                ..FetchInput::default()
+            },
+            &Limits::default(),
+        );
+        let event = NewEvent {
+            ts_ms: 4242,
+            op: "write".into(),
+            selection: "CLIPBOARD".into(),
+            pid: Some(321),
+            app_name: "Notepad".into(),
+            wm_class: String::new(),
+            exec_path: "C:\\Windows\\notepad.exe".into(),
+            window_id: 7,
+            content_id: None, // 由 insert_change 在事务内回填
+            content_type: cap.content_type.clone(),
+            content_size: cap.size,
+            summary: cap.summary.clone(),
+            targets: "text/plain, text/html".into(),
+            source_app: "Notepad".into(),
+            source_pid: Some(321),
+            source_event_id: None,
+            truncated: cap.truncated,
+            x_time: 99,
+            reason: "content_change".into(),
+            pending: false,
+        };
+        let (content_id, event_id) = db.insert_change(&cap, &event, 4242).unwrap();
+        let (events, total) = db.query_events(&EventFilter::default(), 10, 0).unwrap();
+        assert_eq!(total, 1);
+        let row = &events[0];
+        assert_eq!(row.id, event_id);
+        assert_eq!(row.content_id, Some(content_id));
+        assert_eq!(row.pid, Some(321));
+        assert_eq!(row.app_name, "Notepad");
+        assert_eq!(row.exec_path, "C:\\Windows\\notepad.exe");
+        assert_eq!(row.window_id, Some(7));
+        assert_eq!(row.source_app, "Notepad");
+        assert_eq!(row.source_pid, Some(321));
+        assert_eq!(row.reason, "content_change");
+        assert_eq!(row.targets, "text/plain, text/html");
+        let detail = db.get_event(event_id).unwrap().unwrap();
+        assert_eq!(detail.body.as_deref(), Some("cross-platform"));
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn insert_change_rolls_back_when_event_insert_fails() {
+        let (mut db, path) = tmp_db();
+        let cap = assemble(
+            &FetchInput {
+                target_names: vec!["text/plain".into()],
+                plain: Some(b"will-rollback".to_vec()),
+                plain_total: 13,
+                ..FetchInput::default()
+            },
+            &Limits::default(),
+        );
+        // 用触发器让 events 插入中途失败，验证 contents 随事务一起回滚。
+        db.exec_for_test("CREATE TRIGGER reject_events BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'blocked'); END;").unwrap();
+        let event = NewEvent {
+            ts_ms: 1,
+            op: "write".into(),
+            selection: "CLIPBOARD".into(),
+            pid: None,
+            app_name: String::new(),
+            wm_class: String::new(),
+            exec_path: String::new(),
+            window_id: 0,
+            content_id: None,
+            content_type: cap.content_type.clone(),
+            content_size: cap.size,
+            summary: cap.summary.clone(),
+            targets: String::new(),
+            source_app: String::new(),
+            source_pid: None,
+            source_event_id: None,
+            truncated: false,
+            x_time: 0,
+            reason: "content_change".into(),
+            pending: false,
+        };
+        assert!(db.insert_change(&cap, &event, 1).is_err());
+        let (events, total) = db.query_events(&EventFilter::default(), 10, 0).unwrap();
+        assert_eq!(total, 0, "events 插入失败不应留下事件");
+        // contents 也应回滚：统计里不应出现孤儿行。
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.contents, 0, "contents 必须随事务一起回滚");
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = events;
     }
 }

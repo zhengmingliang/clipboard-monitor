@@ -168,16 +168,16 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
 pub fn default_config_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
-        return env_path("APPDATA")
+        env_path("APPDATA")
             .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"))
-            .join(APP_DIR_NAME);
+            .join(APP_DIR_NAME)
     }
     #[cfg(target_os = "macos")]
     {
-        return home_dir()
+        home_dir()
             .join("Library")
             .join("Application Support")
-            .join(APP_DIR_NAME);
+            .join(APP_DIR_NAME)
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
@@ -191,16 +191,16 @@ pub fn default_config_dir() -> PathBuf {
 pub fn default_data_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
-        return env_path("LOCALAPPDATA")
+        env_path("LOCALAPPDATA")
             .unwrap_or_else(|| home_dir().join("AppData").join("Local"))
-            .join(APP_DIR_NAME);
+            .join(APP_DIR_NAME)
     }
     #[cfg(target_os = "macos")]
     {
-        return home_dir()
+        home_dir()
             .join("Library")
             .join("Application Support")
-            .join(APP_DIR_NAME);
+            .join(APP_DIR_NAME)
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {

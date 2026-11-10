@@ -228,7 +228,7 @@
 
   <section id="tab-rules" class="hidden">
     <div class="panel">
-      <p>每行一条。可以写进程名、可执行文件名或 WM_CLASS，也可以写进程号。多个程序都叫 python3 时，用 <code>pid:进程号</code> 或单独一行数字，只排除这一个进程。进程重启后 PID 会变，需要重新填。监控进程自身始终排除。</p>
+      <p>每行一条。可以写进程名、可执行文件名或 WM_CLASS（Linux/X11），也可以写进程号。多个程序都叫 python3 时，用 <code>pid:进程号</code> 或单独一行数字，只排除这一个进程。进程重启后 PID 会变，需要重新填。监控进程自身始终排除。白名单在 Windows、macOS、Linux 上都生效：命中的程序内容不会写入数据库。</p>
       <textarea id="whitelist" placeholder="例如&#10;keepassxc&#10;pid:4242&#10;9001"></textarea>
       <p><button id="save-white" class="primary">保存白名单</button> <span id="white-msg" class="note"></span></p>
     </div>
@@ -360,6 +360,22 @@ function targetChips(raw) {
   if (!parts.length) return `<span class="note">无</span>`;
   return `<div class="targets">${parts.map(t => `<span class="target">${escapeHtml(t)}</span>`).join("")}</div>`;
 }
+// 推断读取（Windows 的间接信号）必须与可靠读取（X11 RECORD）区分展示。
+function opLabel(ev) {
+  if (ev.op !== "read") return "写入";
+  return ev.reason === "inferred_read" ? "推断读取" : "读取";
+}
+const reasonNames = {
+  content_change: "内容变化", cleared: "剪贴板已清空", format_change: "格式变化",
+  sequence_change: "变更序号变化", snapshot: "启动快照", reenabled: "恢复监控",
+  inferred_read: "推断读取（非可靠审计）", owner_change: "所有者变化",
+  window_destroy: "所有者窗口销毁", client_close: "所有者进程退出",
+  read: "读取", changed: "内容变化", snapshot_read: "读取快照",
+};
+function reasonLabel(reason) {
+  const raw = reason || "";
+  return reasonNames[raw] ? `${escapeHtml(reasonNames[raw])} (${escapeHtml(raw)})` : escapeHtml(raw);
+}
 function readerNames(reads) {
   const seen = new Set();
   const out = [];
@@ -404,7 +420,9 @@ function renderFlow(flow, currentId) {
 
 async function refreshStatus() {
   const s = await api("/api/status");
-  state.capabilities = s.capabilities || { reads: false, primary: false };
+  // 可靠读取(reads)与推断读取(reads_inferred)分开声明，避免把间接信号
+  // 当成可信审计。source_info / formats 在 Windows/macOS 上可用。
+  state.capabilities = s.capabilities || { reads: false, primary: false, reads_inferred: false, source_info: false, formats: false };
   const ready = Boolean(s.changes_ready);
   $("pill").textContent = s.enabled ? (ready ? "监控中" : "已开启，后端未就绪") : "已暂停";
   $("pill").className = "pill " + (s.enabled && ready ? "on" : "off");
@@ -413,18 +431,20 @@ async function refreshStatus() {
   $("dbpill").textContent = `${db.db_human || ""} / ${s.max_db_human || ""}`;
   const err = s.last_error ? ` · ${s.last_error}` : "";
   const backend = { x11: "Linux/X11", windows: "Windows", macos: "macOS" }[s.backend] || s.backend;
-  const reads = state.capabilities.reads ? ` · 读取 ${s.reads_seen}` : "";
+  const reads = state.capabilities.reads ? ` · 读取 ${s.reads_seen}` : (state.capabilities.reads_inferred ? ` · 推断读取 ${s.reads_seen}` : "");
   $("meta").textContent =
     `${backend} · 写入 ${s.writes_seen}${reads} · 近 24 小时写 ${db.writes_24h || 0} · 保留 ${s.retention_days} 天${err}`;
+  // 可靠读取或推断读取任一可用时都允许按 op=read 筛选。
+  const readFilter = state.capabilities.reads || state.capabilities.reads_inferred;
   document.querySelectorAll('#f-op option[value="read"], #c-op option[value="read"]').forEach(el => {
-    el.hidden = !state.capabilities.reads;
-    el.disabled = !state.capabilities.reads;
+    el.hidden = !readFilter;
+    el.disabled = !readFilter;
   });
   const primaryOption = document.querySelector('#f-sel option[value="PRIMARY"]');
   primaryOption.hidden = !state.capabilities.primary;
   primaryOption.disabled = !state.capabilities.primary;
   $("s-primary").parentElement.classList.toggle("hidden", !state.capabilities.primary);
-  document.querySelector('[data-tab="rules"]').classList.toggle("hidden", s.backend !== "x11");
+  // 白名单现在三平台都生效，规则 tab 不再只对 X11 开放。
 }
 
 async function loadApps() {
@@ -457,7 +477,7 @@ async function loadEvents() {
     if (ev.id === state.selected) tr.className = "selected";
     tr.innerHTML = `
       <td>${fmtTime(ev.ts_ms)}</td>
-      <td><span class="badge ${ev.op}">${ev.op === "read" ? "读取" : "写入"}</span></td>
+      <td><span class="badge ${ev.op}">${opLabel(ev)}</span></td>
       <td>${escapeHtml(displayApp(ev.app_name, ev.exec_path))}${ev.pid ? " · " + ev.pid : ""}</td>
       <td>${escapeHtml(ev.source_app || "")}</td>
       <td>${typeName[ev.content_type] || escapeHtml(ev.content_type || "")}</td>
@@ -493,9 +513,15 @@ async function showDetail(id, tr) {
   const commNote = e.app_name && app !== e.app_name ? ` <span class="note">进程名 ${escapeHtml(e.app_name)}</span>` : "";
   const body = ev.body ? `<pre>${escapeHtml(ev.body)}</pre>` : `<p class="note">没有保存正文。</p>`;
   const blob = ev.has_blob ? `<p><a href="/api/events/${e.id}/file">下载记录的文件内容</a></p>` : "";
+  const trigger = meta.trigger || {};
+  const change = meta.change || {};
+  const triggerNote = trigger.app_name || trigger.window_title
+    ? `<span>触发主体</span><div>${escapeHtml(trigger.app_name || "")}${trigger.pid ? " (pid " + trigger.pid + ")" : ""}${trigger.window_title ? " · " + escapeHtml(trigger.window_title) : ""}</div>` : "";
+  const inferredNote = change.inferred
+    ? `<p class="note">此读取由剪贴板变更序号间接推断，不是可靠的全局读取审计；请以来源信息辅助判断。</p>` : "";
   $("detail").innerHTML = `
-    <h2>${e.op === "read" ? "读取" : "写入"} · ${escapeHtml(app || "未知进程")}</h2>
-    ${renderFlow(ev.flow, e.id)}
+    <h2>${opLabel(e)} · ${escapeHtml(app || "未知进程")}</h2>
+    ${inferredNote}${renderFlow(ev.flow, e.id)}
     <div class="kv">
       <span>时间</span><div>${fmtTime(e.ts_ms)}</div>
       <span>选择区</span><div>${selName[e.selection] || escapeHtml(e.selection || "")}</div>
@@ -503,10 +529,11 @@ async function showDetail(id, tr) {
       <span>路径</span><div>${escapeHtml(e.exec_path || "")}</div>
       <span>窗口类</span><div>${escapeHtml(e.wm_class || "")}</div>
       <span>来源</span><div>${escapeHtml(e.source_app || "")} ${e.source_pid ? "(pid " + e.source_pid + ")" : ""}</div>
+      ${triggerNote}
       <span>类型</span><div>${typeName[e.content_type] || escapeHtml(e.content_type || "")}${e.truncated ? " · 已截断" : ""}</div>
       <span>大小</span><div>${human(e.content_size)}</div>
       <span>格式</span><div>${targetChips(e.targets)}</div>
-      <span>原因</span><div>${escapeHtml(e.reason || "")}</div>
+      <span>原因</span><div>${reasonLabel(e.reason)}</div>
       <span>校验</span><div class="hash">${escapeHtml(ev.sha256 || "")}</div>
     </div>
     ${extra}${body}${blob}

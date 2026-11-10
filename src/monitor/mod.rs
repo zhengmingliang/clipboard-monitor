@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+pub mod observation;
+
 #[cfg(target_os = "linux")]
 mod x11;
 #[cfg(target_os = "linux")]
@@ -27,14 +29,26 @@ mod portable;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use portable as backend;
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "windows")]
+mod win32;
+
 #[cfg(target_os = "linux")]
 pub const BACKEND: &str = "x11";
 #[cfg(target_os = "windows")]
 pub const BACKEND: &str = "windows";
 #[cfg(target_os = "macos")]
 pub const BACKEND: &str = "macos";
+/// 可靠的读取审计：只有 X11 的 RECORD 能拦到 ConvertSelection。
 pub const SUPPORTS_READS: bool = cfg!(target_os = "linux");
 pub const SUPPORTS_PRIMARY: bool = cfg!(target_os = "linux");
+/// OS 能可靠给出内容生产者/触发主体信息的平台。
+pub const SUPPORTS_SOURCE_INFO: bool = cfg!(any(target_os = "windows", target_os = "macos"));
+/// 只能靠变更序号间接推断读取（不可靠、始终标注 inferred）。
+pub const SUPPORTS_INFERRED_READS: bool = cfg!(target_os = "windows");
+/// 能列出剪贴板当前格式清单的平台。
+pub const SUPPORTS_FORMATS: bool = cfg!(any(target_os = "windows", target_os = "macos"));
 
 #[derive(Default)]
 pub struct Counters {
@@ -176,35 +190,128 @@ impl App {
             .clear();
     }
 
-    /// 非 X11 后端已经取得完整内容，直接写入一条变化记录。
+    /// 非 X11 后端已经取得完整内容，按观察契约写入一条变化记录。
+    ///
+    /// `meta_json` 追加 `change` / `source` / `trigger` 子对象，让详情页能
+    /// 说明"这次事件按什么判定、谁产生、谁触发"，同时保持 `EventRow` 的列
+    /// 集合与 X11 完全一致。白名单命中时正文零落盘（与 X11 一致）。
     #[cfg(any(target_os = "windows", target_os = "macos", test))]
-    pub(crate) fn record_change(&self, captured: &Captured, ts_ms: i64) -> Result<i64> {
+    pub(crate) fn record_change(
+        &self,
+        obs: &crate::monitor::observation::ClipboardObservation,
+        spec: &crate::monitor::observation::EventSpec,
+        ts_ms: i64,
+    ) -> Result<i64> {
+        use crate::monitor::observation::{is_source_whitelisted, WhitelistContext};
+
+        let captured = &obs.body;
+        let source = obs.source.clone().unwrap_or_default();
+        let trigger = obs.trigger.clone().unwrap_or_default();
+        let (whitelist, self_pid, self_exe) = {
+            let cfg = self.config.read().unwrap_or_else(|e| e.into_inner());
+            (cfg.whitelist.clone(), self.self_pid, self.self_exe.clone())
+        };
+        let whitelisted = is_source_whitelisted(
+            obs.source.as_ref(),
+            &WhitelistContext {
+                list: &whitelist,
+                self_pid,
+                self_exe: &self_exe,
+            },
+        );
+
+        if whitelisted {
+            // 只更新当前快照，不插 contents / events：敏感程序的内容零落盘。
+            self.snaps.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                "CLIPBOARD".into(),
+                Snap {
+                    content_id: None,
+                    #[cfg(target_os = "linux")]
+                    event_id: None,
+                    #[cfg(target_os = "linux")]
+                    source_app: String::new(),
+                    #[cfg(target_os = "linux")]
+                    source_pid: None,
+                    #[cfg(target_os = "linux")]
+                    owner: 0,
+                    #[cfg(target_os = "linux")]
+                    summary: captured.summary.clone(),
+                    #[cfg(target_os = "linux")]
+                    content_type: captured.content_type.clone(),
+                    #[cfg(target_os = "linux")]
+                    size: captured.size,
+                    #[cfg(target_os = "linux")]
+                    truncated: captured.truncated,
+                    #[cfg(target_os = "linux")]
+                    targets: captured.targets.join(", "),
+                },
+            );
+            self.counters.ignored_self.fetch_add(1, Ordering::Relaxed);
+            return Ok(-1);
+        }
+
+        // 追加观察上下文到 meta_json，不改动共享 classify::assemble 的输出。
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&captured.meta_json).unwrap_or_else(|_| serde_json::json!({}));
+        meta["change"] = spec.change_meta();
+        if source.has_any() {
+            meta["source"] = serde_json::json!({
+                "pid": source.pid,
+                "app_name": source.app_name,
+                "exec_path": source.exec_path,
+                "window_id": source.window_id,
+            });
+        }
+        if trigger.has_any() {
+            meta["trigger"] = serde_json::json!({
+                "pid": trigger.pid,
+                "app_name": trigger.app_name,
+                "window_title": trigger.window_title,
+            });
+        }
+        if !obs.formats.is_empty() {
+            meta["formats"] = serde_json::json!(obs.formats);
+        }
+        if let Some(seq) = obs.sequence {
+            meta["sequence"] = serde_json::json!(seq);
+        }
+        let enriched = Captured {
+            meta_json: meta.to_string(),
+            ..captured.clone()
+        };
+
         let (content_id, event_id) = {
-            let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
-            let content_id = db.insert_content(captured, ts_ms)?;
-            let event_id = db.insert_event(&NewEvent {
+            let mut db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+            db.insert_change(
+                &enriched,
+                &NewEvent {
+                    ts_ms,
+                    op: spec.op.into(),
+                    selection: "CLIPBOARD".into(),
+                    pid: source.pid,
+                    app_name: source.app_name.clone(),
+                    wm_class: String::new(), // X11 概念，其他平台恒空
+                    exec_path: source.exec_path.clone(),
+                    window_id: source.window_id,
+                    content_id: None, // insert_change 在事务内回填
+                    content_type: captured.content_type.clone(),
+                    content_size: captured.size,
+                    summary: captured.summary.clone(),
+                    targets: if obs.formats.is_empty() {
+                        captured.targets.join(", ")
+                    } else {
+                        obs.formats.join(", ")
+                    },
+                    source_app: source.app_name.clone(),
+                    source_pid: source.pid,
+                    source_event_id: None,
+                    truncated: captured.truncated,
+                    x_time: obs.sequence.unwrap_or(0) as u32,
+                    reason: spec.reason.into(),
+                    pending: false,
+                },
                 ts_ms,
-                op: "write".into(),
-                selection: "CLIPBOARD".into(),
-                pid: None,
-                app_name: String::new(),
-                wm_class: String::new(),
-                exec_path: String::new(),
-                window_id: 0,
-                content_id: Some(content_id),
-                content_type: captured.content_type.clone(),
-                content_size: captured.size,
-                summary: captured.summary.clone(),
-                targets: captured.targets.join(", "),
-                source_app: String::new(),
-                source_pid: None,
-                source_event_id: None,
-                truncated: captured.truncated,
-                x_time: 0,
-                reason: "changed".into(),
-                pending: false,
-            })?;
-            (content_id, event_id)
+            )?
         };
         #[cfg(not(target_os = "linux"))]
         let _ = event_id;
@@ -215,9 +322,9 @@ impl App {
                 #[cfg(target_os = "linux")]
                 event_id: Some(event_id),
                 #[cfg(target_os = "linux")]
-                source_app: String::new(),
+                source_app: source.app_name.clone(),
                 #[cfg(target_os = "linux")]
-                source_pid: None,
+                source_pid: source.pid,
                 #[cfg(target_os = "linux")]
                 owner: 0,
                 #[cfg(target_os = "linux")]
@@ -229,10 +336,14 @@ impl App {
                 #[cfg(target_os = "linux")]
                 truncated: captured.truncated,
                 #[cfg(target_os = "linux")]
-                targets: captured.targets.join(", "),
+                targets: obs.formats.join(", "),
             },
         );
-        self.counters.writes.fetch_add(1, Ordering::Relaxed);
+        if spec.op == "read" {
+            self.counters.reads.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.counters.writes.fetch_add(1, Ordering::Relaxed);
+        }
         self.counters.last_event_ms.store(ts_ms, Ordering::Relaxed);
         Ok(content_id)
     }
@@ -307,9 +418,13 @@ mod tests {
     use crate::db::EventFilter;
 
     #[test]
-    fn native_change_is_stored_with_text_and_current_snapshot() {
+    fn native_change_is_stored_with_text_metadata_and_current_snapshot() {
+        use crate::monitor::observation::{
+            classify_event, ClipboardObservation, SourceInfo, TriggerInfo,
+        };
+
         let dir = std::env::temp_dir().join(format!(
-            "clipboard-monitor-test-{}-{}",
+            "clipboard-monitor-metadata-test-{}-{}",
             std::process::id(),
             crate::now_ms()
         ));
@@ -325,16 +440,89 @@ mod tests {
             },
             &Limits::default(),
         );
-        let content_id = app.record_change(&captured, 1234).expect("record change");
+        let mut obs = ClipboardObservation::new(captured);
+        obs.formats = vec!["text/plain".into(), "text/html".into()];
+        obs.sequence = Some(42);
+        obs.source = Some(SourceInfo {
+            pid: Some(1234),
+            app_name: "Notepad".into(),
+            exec_path: "C:\\Windows\\notepad.exe".into(),
+            window_id: 7,
+        });
+        obs.trigger = Some(TriggerInfo {
+            pid: Some(1234),
+            app_name: "Notepad".into(),
+            window_title: "Untitled".into(),
+        });
+        let spec = classify_event(None, &obs).expect("首条观察应落库");
+        let content_id = app.record_change(&obs, &spec, 1234).expect("record change");
         assert_eq!(app.counters.writes.load(Ordering::Relaxed), 1);
         assert_eq!(app.keep_content_ids(), vec![content_id]);
         let db = app.db.lock().unwrap();
         let (events, total) = db.query_events(&EventFilter::default(), 10, 0).unwrap();
         assert_eq!(total, 1);
-        assert_eq!(events[0].content_id, Some(content_id));
-        assert_eq!(events[0].content_type, "text");
+        let row = &events[0];
+        assert_eq!(row.content_id, Some(content_id));
+        assert_eq!(row.content_type, "text");
+        assert_eq!(row.pid, Some(1234));
+        assert_eq!(row.app_name, "Notepad");
+        assert_eq!(row.exec_path, "C:\\Windows\\notepad.exe");
+        assert_eq!(row.window_id, Some(7));
+        assert_eq!(row.source_app, "Notepad");
+        assert_eq!(row.source_pid, Some(1234));
+        assert_eq!(row.reason, "snapshot");
+        assert_eq!(row.targets, "text/plain, text/html");
         let detail = db.get_event(events[0].id).unwrap().unwrap();
         assert_eq!(detail.body.as_deref(), Some("cross-platform text"));
+        let meta: serde_json::Value =
+            serde_json::from_str(detail.meta_json.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["change"]["kind"], "snapshot");
+        assert_eq!(meta["source"]["app_name"], "Notepad");
+        assert_eq!(meta["trigger"]["window_title"], "Untitled");
+        assert_eq!(meta["formats"][1], "text/html");
+        assert_eq!(meta["sequence"], 42);
+        drop(db);
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn whitelisted_source_keeps_content_out_of_db() {
+        use crate::monitor::observation::{classify_event, ClipboardObservation, SourceInfo};
+
+        let dir = std::env::temp_dir().join(format!(
+            "clipboard-monitor-whitelist-test-{}-{}",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        let config = Config {
+            whitelist: vec!["SecretApp".into()],
+            ..Config::default()
+        };
+        let db = Database::open(&dir.join("monitor.db")).expect("open test database");
+        let app = App::new(db, config, dir.join("config.json"));
+        let mut obs = ClipboardObservation::new(assemble(
+            &FetchInput {
+                plain: Some(b"top secret".to_vec()),
+                plain_mime: Some("text/plain".into()),
+                plain_total: 10,
+                target_names: vec!["text/plain".into()],
+                ..FetchInput::default()
+            },
+            &Limits::default(),
+        ));
+        obs.source = Some(SourceInfo {
+            app_name: "SecretApp".into(),
+            ..Default::default()
+        });
+        let spec = classify_event(None, &obs).expect("首条观察应落库");
+        let content_id = app.record_change(&obs, &spec, 1234).expect("record change");
+        assert_eq!(content_id, -1, "白名单命中不应产生 contents 行");
+        assert_eq!(app.counters.writes.load(Ordering::Relaxed), 0);
+        assert_eq!(app.counters.ignored_self.load(Ordering::Relaxed), 1);
+        let db = app.db.lock().unwrap();
+        let (_events, total) = db.query_events(&EventFilter::default(), 10, 0).unwrap();
+        assert_eq!(total, 0, "白名单命中不应产生 events 行");
         drop(db);
         drop(app);
         let _ = std::fs::remove_dir_all(dir);

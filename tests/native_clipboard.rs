@@ -1,6 +1,10 @@
 //! 真实系统剪贴板端到端验证，会替换当前 CLIPBOARD，默认不运行。
 //!
 //! CI: CLIPBOARD_MONITOR_NATIVE_LIVE=1 cargo test --release --test native_clipboard -- --ignored
+//!
+//! 覆盖三平台共享契约：文本/图片写入、去重、清空语义、元数据、能力声明。
+//! 平台相关的差异（X11 的可靠读取审计、Windows 的推断读取）由各自的
+//! capabilities 声明，测试按 cfg 分别校验，不要求三平台行为完全一致。
 
 use arboard::{Clipboard, ImageData};
 use clipboard_monitor::now_ms;
@@ -62,10 +66,16 @@ fn run_native_test() -> Result<(), Box<dyn std::error::Error>> {
         .stderr(Stdio::from(log))
         .spawn()?;
     let mut child = ChildGuard(child);
+    let mut clipboard = Clipboard::new()?;
+    // 结束后尽量恢复用户原来的剪贴板：原实现直接污染不还原。
+    let original_text = clipboard.get_text().ok();
+    let original_image = clipboard.get_image().ok();
+
     let result = (|| {
         let base = wait_listen(&dir, &mut child.0)?;
         wait_backend(&base, &mut child.0)?;
-        let mut clipboard = Clipboard::new()?;
+        verify_capabilities(&base)?;
+
         let token = format!("NATIVE-TEXT-{}-{}", std::process::id(), now_ms());
         clipboard.set_text(token.clone())?;
         let (text_event, text_detail) = wait_event(&base, Duration::from_secs(20), |event| {
@@ -77,6 +87,22 @@ fn run_native_test() -> Result<(), Box<dyn std::error::Error>> {
                     .contains(&token)
         })?;
         assert_eq!(text_detail["body"].as_str(), Some(token.as_str()));
+        verify_source_metadata(&text_event, &text_detail)?;
+
+        // 去重是 portable 后端（Win/macOS）的契约：X11 按所有权变化记事件，
+        // 同一文本再次声明所有权会产生新的一条，不强求内容级去重。
+        if !cfg!(target_os = "linux") {
+            std::thread::sleep(Duration::from_millis(300));
+            clipboard.set_text(token.clone())?;
+            std::thread::sleep(Duration::from_secs(3));
+            let duplicates = count_events(&base, |event| {
+                event["summary"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(&token)
+            })?;
+            assert_eq!(duplicates, 1, "同一内容重复写入应被去重为一条");
+        }
 
         let text_id = text_event["id"].as_i64().ok_or("文本事件没有 ID")?;
         let rgba = vec![
@@ -87,7 +113,7 @@ fn run_native_test() -> Result<(), Box<dyn std::error::Error>> {
             height: 2,
             bytes: Cow::Owned(rgba),
         })?;
-        let (_image_event, image_detail) = wait_event(&base, Duration::from_secs(20), |event| {
+        let (image_event, image_detail) = wait_event(&base, Duration::from_secs(20), |event| {
             event["op"] == "write"
                 && event["content_type"] == "image"
                 && event["id"].as_i64().unwrap_or(0) > text_id
@@ -108,8 +134,38 @@ fn run_native_test() -> Result<(), Box<dyn std::error::Error>> {
             "image/x-rgba"
         };
         assert_eq!(meta["image"]["mime"], expected_mime);
+        verify_source_metadata(&image_event, &image_detail)?;
+
+        // 清空语义同样只属于 portable 后端：X11 的空文本目标由 fetch 层
+        // 处理，语义不同，不在跨平台契约里强求。
+        if !cfg!(target_os = "linux") && clipboard.set_text(String::new()).is_ok() {
+            let (clear_event, _clear_detail) =
+                wait_event(&base, Duration::from_secs(20), |event| {
+                    event["op"] == "write"
+                        && event["content_type"] == "empty"
+                        && event["id"].as_i64().unwrap_or(0)
+                            > image_event["id"].as_i64().unwrap_or(0)
+                })?;
+            assert_eq!(
+                clear_event["reason"].as_str(),
+                Some("cleared"),
+                "清空应带 cleared 语义"
+            );
+        }
         Ok::<(), Box<dyn std::error::Error>>(())
     })();
+
+    // 恢复剪贴板（尽力而为，失败不影响测试结论）。
+    if let Some(text) = original_text {
+        let _ = clipboard.set_text(text);
+    } else if let Some(image) = original_image {
+        let _ = clipboard.set_image(ImageData {
+            width: image.width,
+            height: image.height,
+            bytes: image.bytes,
+        });
+    }
+
     if let Err(err) = result {
         let logs = fs::read_to_string(&log_path).unwrap_or_default();
         return Err(format!("{err}\n监控日志:\n{logs}").into());
@@ -118,6 +174,72 @@ fn run_native_test() -> Result<(), Box<dyn std::error::Error>> {
     child.0.wait()?;
     let _ = fs::remove_dir_all(dir);
     Ok(())
+}
+
+/// 能力声明必须与实际后端一致；`changes_ready` 为真时不能谎报能力。
+fn verify_capabilities(base: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let status = get_json(&format!("{base}/api/status"))?;
+    assert_eq!(status["changes_ready"], true, "后端应已就绪");
+    let caps = &status["capabilities"];
+    assert_eq!(caps["text"], true);
+    assert_eq!(caps["image"], true);
+    if cfg!(target_os = "linux") {
+        assert_eq!(caps["reads"], true, "X11 应声明可靠读取");
+        assert_eq!(caps["primary"], true);
+        assert_eq!(caps["source_info"], false);
+        assert_eq!(caps["reads_inferred"], false);
+    } else {
+        assert_eq!(caps["reads"], false, "非 X11 不得声称可靠读取");
+        assert_eq!(caps["primary"], false);
+        assert_eq!(caps["source_info"], true, "Win/mac 应声明来源信息能力");
+        assert_eq!(caps["formats"], true);
+        assert_eq!(
+            caps["reads_inferred"],
+            cfg!(target_os = "windows"),
+            "只有 Windows 声明推断读取"
+        );
+    }
+    Ok(())
+}
+
+/// Windows/macOS 应至少给出一项来源元数据，且 meta_json 带 change 判定依据。
+/// Linux/X11 有自己的来源解析链路，这里只校验共享的 change 子对象。
+fn verify_source_metadata(event: &Value, detail: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    let meta: Value = serde_json::from_str(detail["meta_json"].as_str().ok_or("事件没有元数据")?)?;
+    if !cfg!(target_os = "linux") {
+        let has_source = event["pid"].is_i64()
+            || !event["app_name"].as_str().unwrap_or_default().is_empty()
+            || !event["exec_path"].as_str().unwrap_or_default().is_empty()
+            || event["window_id"].as_i64().unwrap_or(0) != 0;
+        assert!(
+            has_source,
+            "非 X11 平台应采集到至少一项来源元数据，实际事件: {event}"
+        );
+        assert!(
+            meta["change"]["kind"].is_string(),
+            "meta_json.change 应给出事件语义"
+        );
+        assert!(
+            meta["formats"].is_array(),
+            "meta_json.formats 应记录格式清单"
+        );
+    }
+    Ok(())
+}
+
+/// 统计满足条件的事件数（用于 portable 后端的去重断言）。
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn count_events(
+    base: &str,
+    predicate: impl Fn(&Value) -> bool,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let events = get_json(&format!("{base}/api/events?limit=200"))?;
+    Ok(events["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|event| predicate(event))
+        .count())
 }
 
 fn wait_listen(dir: &Path, child: &mut Child) -> Result<String, Box<dyn std::error::Error>> {

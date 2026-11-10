@@ -484,8 +484,13 @@ fn status_json(app: &App) -> Result<Value> {
         "capabilities": {
             "text": true,
             "image": true,
+            // 只有 X11 能通过 RECORD 可靠审计读取；其它平台不要把推断
+            // 读取混同为可靠读取。
             "reads": crate::monitor::SUPPORTS_READS,
             "primary": crate::monitor::SUPPORTS_PRIMARY,
+            "source_info": crate::monitor::SUPPORTS_SOURCE_INFO,
+            "reads_inferred": crate::monitor::SUPPORTS_INFERRED_READS,
+            "formats": crate::monitor::SUPPORTS_FORMATS,
         },
         "xfixes": app.xfixes_ok.load(Ordering::Relaxed),
         "record": app.record_ok.load(Ordering::Relaxed),
