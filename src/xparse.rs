@@ -15,7 +15,9 @@ pub struct ConvertSelectionReq {
 /// 从一段 RECORD `FromClient` 数据里抽出全部 ConvertSelection。
 ///
 /// `swapped` 为真时，被记录客户端的字节序与本进程相反。
-pub fn parse_convert_selections(data: &[u8], swapped: bool) -> Vec<ConvertSelectionReq> {
+/// 返回解析出的请求，以及已完整消费的字节数——`data[consumed..]` 是
+/// 被分块截断的请求残片，调用方可暂存并与下一块拼接。
+pub fn parse_convert_selections(data: &[u8], swapped: bool) -> (Vec<ConvertSelectionReq>, usize) {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 4 <= data.len() {
@@ -44,7 +46,32 @@ pub fn parse_convert_selections(data: &[u8], swapped: bool) -> Vec<ConvertSelect
         }
         i += total;
     }
-    out
+    (out, i)
+}
+
+/// 残片是否值得留给下一块拼接：按 4 字节对齐，且头部声明的请求长度
+/// 超出当前数据。上限 64KB，防止异常数据无限累积。
+pub fn partial_request_carry(rest: &[u8], swapped: bool) -> Option<Vec<u8>> {
+    const MAX_CARRY: usize = 64 * 1024;
+    if rest.is_empty() || !rest.len().is_multiple_of(4) || rest.len() > MAX_CARRY {
+        return None;
+    }
+    let len16 = read_u16(&rest[2..4], swapped) as usize;
+    let claimed = if len16 == 0 {
+        if rest.len() < 8 {
+            // 扩展头还需 4 字节才能读总长，先保留。
+            return Some(rest.to_vec());
+        }
+        let ext = read_u32(&rest[4..8], swapped) as usize;
+        ext.saturating_mul(4)
+    } else {
+        len16.saturating_mul(4)
+    };
+    if claimed > rest.len() && claimed <= MAX_CARRY {
+        Some(rest.to_vec())
+    } else {
+        None
+    }
 }
 
 fn read_u16(b: &[u8], swapped: bool) -> u16 {
@@ -92,7 +119,8 @@ mod tests {
         put_u32(&mut raw[12..16], 0x33);
         put_u32(&mut raw[16..20], 0x44);
         put_u32(&mut raw[20..24], 0x55);
-        let got = parse_convert_selections(&raw, false);
+        let (got, consumed) = parse_convert_selections(&raw, false);
+        assert_eq!(consumed, 24);
         assert_eq!(
             got,
             vec![ConvertSelectionReq {
@@ -118,7 +146,8 @@ mod tests {
         put_u32(&mut raw[20..24], 9);
         put_u32(&mut raw[24..28], 10);
         put_u32(&mut raw[28..32], 11);
-        let got = parse_convert_selections(&raw, false);
+        let (got, consumed) = parse_convert_selections(&raw, false);
+        assert_eq!(consumed, 32);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].requestor, 7);
         assert_eq!(got[0].target, 9);
@@ -156,9 +185,57 @@ mod tests {
         raw[5] = req[2];
         raw[6] = req[1];
         raw[7] = req[0];
-        let got = parse_convert_selections(&raw, true);
+        let (got, consumed) = parse_convert_selections(&raw, true);
+        assert_eq!(consumed, 24);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].requestor, 0x0102_0304);
+    }
+
+    #[test]
+    fn split_request_is_assembled_from_carry() {
+        let mut raw = [0u8; 24];
+        raw[0] = CONVERT_SELECTION_OPCODE;
+        put_u16(&mut raw[2..4], 6);
+        put_u32(&mut raw[4..8], 0x1111);
+        put_u32(&mut raw[8..12], 0x2222);
+        put_u32(&mut raw[12..16], 0x3333);
+        put_u32(&mut raw[16..20], 0x4444);
+        put_u32(&mut raw[20..24], 0x5555);
+
+        // 第一块只有前 8 字节：解析不出请求，但应留下残片。
+        let (first, consumed) = parse_convert_selections(&raw[..8], false);
+        assert!(first.is_empty());
+        assert_eq!(consumed, 0);
+        let carry = partial_request_carry(&raw[..8], false).expect("残片应保留");
+
+        // 第二块补齐剩余 16 字节，拼上残片后应解出完整请求。
+        let mut joined = carry;
+        joined.extend_from_slice(&raw[8..]);
+        let (second, consumed2) = parse_convert_selections(&joined, false);
+        assert_eq!(consumed2, 24);
+        assert_eq!(
+            second,
+            vec![ConvertSelectionReq {
+                requestor: 0x1111,
+                selection: 0x2222,
+                target: 0x3333,
+                property: 0x4444,
+                time: 0x5555,
+            }]
+        );
+    }
+
+    #[test]
+    fn zero_length_garbage_is_not_carried() {
+        // len16=0 且扩展长度=0 的垃圾尾巴不应被保留，避免无限累积。
+        let mut raw = [0u8; 32];
+        raw[0] = CONVERT_SELECTION_OPCODE;
+        put_u16(&mut raw[2..4], 6);
+        put_u32(&mut raw[4..8], 0x11);
+        let (reqs, consumed) = parse_convert_selections(&raw, false);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(consumed, 24);
+        assert!(partial_request_carry(&raw[consumed..], false).is_none());
     }
 
     #[test]

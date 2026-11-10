@@ -17,7 +17,7 @@ use crate::resolver::{AppInfo, Resolver};
 use crate::x11util::{
     self, client_range, connect_x, create_helper_window, raw_fd, wait_readable, XConn,
 };
-use crate::xparse::parse_convert_selections;
+use crate::xparse::{parse_convert_selections, partial_request_carry};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -360,6 +360,8 @@ fn read_loop(app: &App, tx: &Sender<Msg>, context: u32) -> Result<()> {
     app.record_ok.store(true, Ordering::Relaxed);
     log_info("读取监控已挂上 RECORD");
     let mut seq = 1_000_000u64;
+    // RECORD 数据块可能把请求拦腰截断；按客户端暂存残片，与下一块拼接。
+    let mut carries: HashMap<u32, Vec<u8>> = HashMap::new();
     for reply in conn.record_enable_context(context)? {
         if app.shutdown.load(Ordering::Relaxed) {
             break;
@@ -372,10 +374,18 @@ fn read_loop(app: &App, tx: &Sender<Msg>, context: u32) -> Result<()> {
         if reply.category != 1 || reply.data.is_empty() {
             continue;
         }
+        let reqs = {
+            let mut buf = carries.remove(&reply.xid_base).unwrap_or_default();
+            buf.extend_from_slice(&reply.data);
+            let (reqs, consumed) = parse_convert_selections(&buf, reply.client_swapped);
+            if let Some(carry) = partial_request_carry(&buf[consumed..], reply.client_swapped) {
+                carries.insert(reply.xid_base, carry);
+            }
+            reqs
+        };
         if !app.enabled.load(Ordering::Relaxed) {
             continue;
         }
-        let reqs = parse_convert_selections(&reply.data, reply.client_swapped);
         for req in reqs {
             if app.is_self_client(reply.xid_base, req.requestor) {
                 app.counters.ignored_self.fetch_add(1, Ordering::Relaxed);
