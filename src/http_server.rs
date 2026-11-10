@@ -8,6 +8,7 @@ use crate::now_ms;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
@@ -36,12 +37,13 @@ pub fn serve(app: Arc<App>) -> Result<()> {
         crate::log_warn("监听地址不是回环地址，剪贴板日志可能被同网段访问");
     }
     listener.set_nonblocking(true)?;
+    let port = addr.port();
     while !app.shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
                 let app = Arc::clone(&app);
                 // 请求很少，串行处理即可，避免再开线程堆内存。
-                if let Err(err) = handle_client(app, stream) {
+                if let Err(err) = handle_client(app, stream, port) {
                     crate::log_debug(format!("HTTP: {err:#}"));
                 }
             }
@@ -68,7 +70,7 @@ fn is_loopback(addr: &str) -> bool {
     addr.starts_with("127.") || addr.starts_with("[::1]") || addr.starts_with("localhost:")
 }
 
-fn handle_client(app: Arc<App>, mut stream: TcpStream) -> Result<()> {
+fn handle_client(app: Arc<App>, mut stream: TcpStream, port: u16) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut buf = Vec::new();
@@ -95,11 +97,15 @@ fn handle_client(app: Arc<App>, mut stream: TcpStream) -> Result<()> {
     let method = parts.next().unwrap_or("").to_string();
     let target = parts.next().unwrap_or("/").to_string();
     let mut content_length = 0usize;
+    let mut headers: HashMap<String, String> = HashMap::new();
     for line in lines {
-        if let Some(v) = line.split_once(':') {
-            if v.0.eq_ignore_ascii_case("content-length") {
-                content_length = v.1.trim().parse().unwrap_or(0);
+        if let Some((k, v)) = line.split_once(':') {
+            let key = k.trim().to_ascii_lowercase();
+            let value = v.trim().to_string();
+            if key == "content-length" {
+                content_length = value.parse().unwrap_or(0);
             }
+            headers.insert(key, value);
         }
     }
     if content_length > 1_048_576 {
@@ -114,6 +120,17 @@ fn handle_client(app: Arc<App>, mut stream: TcpStream) -> Result<()> {
     }
     let body =
         &buf[header_end..header_end + content_length.min(buf.len().saturating_sub(header_end))];
+    if let Err(err) = authorize(&app, &method, &headers, port) {
+        crate::log_debug(format!("HTTP 请求被拒绝: {err:#}"));
+        return write_response(
+            &mut stream,
+            Response {
+                status: 403,
+                content_type: "application/json; charset=utf-8",
+                body: json!({"error": err.to_string()}).to_string().into_bytes(),
+            },
+        );
+    }
     let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
     let response = dispatch(&app, &method, path, query, body);
     match response {
@@ -142,10 +159,100 @@ struct Response {
     body: Vec<u8>,
 }
 
+/// DNS 重绑定与跨站请求防护。
+///
+/// Host 只接受回环地址、IP 字面量或配置里写的监听主机名——浏览器在重绑定的
+/// 域名下仍会把原域名放进 Host，域名不在白名单即被拒绝。写操作额外要求
+/// JSON Content-Type 与同源标记，挡住 text/plain 表单 CSRF。
+fn authorize(app: &App, method: &str, headers: &HashMap<String, String>, port: u16) -> Result<()> {
+    let configured = host_part_of(&app.config.read().unwrap_or_else(|e| e.into_inner()).listen);
+    authorize_request(method, headers, port, &configured)
+}
+
+fn authorize_request(
+    method: &str,
+    headers: &HashMap<String, String>,
+    port: u16,
+    configured: &str,
+) -> Result<()> {
+    if let Some(host) = headers.get("host") {
+        check_host(host, port, configured)?;
+    }
+    if matches!(method, "POST" | "PUT" | "DELETE") {
+        let content_type = headers
+            .get("content-type")
+            .map(|v| v.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !content_type.starts_with("application/json") {
+            bail!("写接口要求 Content-Type: application/json");
+        }
+        if let Some(site) = headers.get("sec-fetch-site") {
+            if !site.eq_ignore_ascii_case("same-origin") {
+                bail!("拒绝跨站点写请求");
+            }
+        }
+        if let Some(origin) = headers.get("origin") {
+            let authority = origin.split("://").nth(1).unwrap_or(origin);
+            check_host(authority, port, configured)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_host(host: &str, port: u16, configured: &str) -> Result<()> {
+    let (host_part, host_port) = split_host_port(host.trim())?;
+    if let Some(p) = host_port {
+        if p != port {
+            bail!("Host 端口 {p} 与界面端口 {port} 不一致");
+        }
+    }
+    let host_l = host_part.to_ascii_lowercase();
+    if host_l == "localhost" || host_l.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    if !configured.is_empty() && host_l == configured.to_ascii_lowercase() {
+        return Ok(());
+    }
+    bail!("Host {host_part} 不受信任");
+}
+
+/// 拆 "127.0.0.1:27890"、"[::1]:27890"、"myhost:80"，返回不带方括号的主机部分。
+fn split_host_port(host: &str) -> Result<(String, Option<u16>)> {
+    if let Some(rest) = host.strip_prefix('[') {
+        let end = rest.find(']').context("Host 缺少右括号")?;
+        let port = match rest[end + 1..].strip_prefix(':') {
+            Some(p) => Some(p.parse().with_context(|| format!("Host 端口无效: {p}"))?),
+            None => None,
+        };
+        return Ok((rest[..end].to_string(), port));
+    }
+    match host.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            Ok((h.to_string(), Some(p.parse().context("Host 端口无效")?)))
+        }
+        _ => Ok((host.to_string(), None)),
+    }
+}
+
+fn host_part_of(addr: &str) -> String {
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].to_string();
+        }
+    }
+    match addr.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            h.to_string()
+        }
+        _ => addr.to_string(),
+    }
+}
+
 fn write_response(stream: &mut TcpStream, resp: Response) -> Result<()> {
     let reason = match resp.status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         _ => "Error",
     };
@@ -362,4 +469,79 @@ fn percent_decode(s: &str) -> String {
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hdr(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn host_allows_loopback_and_ips_rejects_domains() {
+        assert!(check_host("127.0.0.1:27890", 27890, "").is_ok());
+        assert!(check_host("localhost:27890", 27890, "").is_ok());
+        assert!(check_host("[::1]:27890", 27890, "").is_ok());
+        assert!(check_host("192.168.1.5:27890", 27890, "").is_ok());
+        assert!(check_host("mybox.local:27890", 27890, "mybox.local").is_ok());
+        assert!(check_host("evil.example:27890", 27890, "").is_err());
+        assert!(check_host("evil.example", 27890, "").is_err());
+        assert!(check_host("127.0.0.1:9999", 27890, "").is_err());
+    }
+
+    #[test]
+    fn host_part_of_strips_port_and_brackets() {
+        assert_eq!(host_part_of("127.0.0.1:27890"), "127.0.0.1");
+        assert_eq!(host_part_of("[::1]:27890"), "::1");
+        assert_eq!(host_part_of("mybox.local"), "mybox.local");
+    }
+
+    #[test]
+    fn write_requests_require_json_and_same_origin() {
+        let ok = hdr(&[
+            ("host", "127.0.0.1:27890"),
+            ("content-type", "application/json"),
+        ]);
+        assert!(authorize_request("POST", &ok, 27890, "").is_ok());
+
+        let plain = hdr(&[("host", "127.0.0.1:27890"), ("content-type", "text/plain")]);
+        assert!(authorize_request("POST", &plain, 27890, "").is_err());
+
+        let no_ct = hdr(&[("host", "127.0.0.1:27890")]);
+        assert!(authorize_request("POST", &no_ct, 27890, "").is_err());
+
+        let cross = hdr(&[
+            ("host", "127.0.0.1:27890"),
+            ("content-type", "application/json"),
+            ("sec-fetch-site", "cross-site"),
+        ]);
+        assert!(authorize_request("PUT", &cross, 27890, "").is_err());
+
+        let evil_origin = hdr(&[
+            ("host", "127.0.0.1:27890"),
+            ("content-type", "application/json"),
+            ("origin", "http://evil.example"),
+        ]);
+        assert!(authorize_request("POST", &evil_origin, 27890, "").is_err());
+
+        let same_origin = hdr(&[
+            ("host", "127.0.0.1:27890"),
+            ("content-type", "application/json"),
+            ("origin", "http://127.0.0.1:27890"),
+        ]);
+        assert!(authorize_request("POST", &same_origin, 27890, "").is_ok());
+    }
+
+    #[test]
+    fn get_requests_do_not_need_content_type() {
+        let get = hdr(&[("host", "127.0.0.1:27890")]);
+        assert!(authorize_request("GET", &get, 27890, "").is_ok());
+        let no_host = hdr(&[]);
+        assert!(authorize_request("GET", &no_host, 27890, "").is_ok());
+    }
 }
