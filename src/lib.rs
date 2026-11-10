@@ -49,15 +49,49 @@ pub fn log_warn(msg: impl AsRef<str>) {
 }
 
 fn log_line(level: &str, msg: &str) {
-    let ms = now_ms();
-    let secs = ms / 1000;
-    let frac = ms % 1000;
-    let t = secs.rem_euclid(86_400);
-    let h = t / 3600;
-    let m = (t % 3600) / 60;
-    let s = t % 60;
+    let stamp = local_timestamp(now_ms());
     let mut err = std::io::stderr().lock();
-    let _ = writeln!(err, "[{h:02}:{m:02}:{s:02}.{frac:03}] {level} {msg}");
+    let _ = writeln!(err, "[{stamp}] {level} {msg}");
+}
+
+/// 本地时间 HH:MM:SS.mmm。此前按 UTC 秒数输出且无时区标注，跨时区排障需心算。
+pub fn local_timestamp(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let frac = ms.rem_euclid(1000);
+    #[cfg(unix)]
+    {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let t = secs as libc::time_t;
+        let parsed = unsafe { libc::localtime_r(&t, &mut tm) };
+        if parsed.is_null() {
+            return format!("??:??:??.{frac:03}");
+        }
+        format!(
+            "{:02}:{:02}:{:02}.{:03}",
+            tm.tm_hour, tm.tm_min, tm.tm_sec, frac
+        )
+    }
+    #[cfg(windows)]
+    {
+        let offset = time::UtcOffset::current_local_offset().ok();
+        match time::OffsetDateTime::from_unix_timestamp(secs)
+            .ok()
+            .zip(offset)
+        {
+            Some((t, off)) => format!(
+                "{:02}:{:02}:{:02}.{:03}",
+                t.to_offset(off).hour(),
+                t.to_offset(off).minute(),
+                t.to_offset(off).second(),
+                t.millisecond()
+            ),
+            None => format!("??:??:??.{frac:03}"),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        format!("??:??:??.{frac:03}")
+    }
 }
 
 pub fn now_ms() -> i64 {
@@ -79,5 +113,28 @@ pub fn human_bytes(n: u64) -> String {
         format!("{n} B")
     } else {
         format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_matches_local_hms_format() {
+        let stamp = local_timestamp(now_ms());
+        let re = regex_shape(&stamp);
+        assert!(re, "时间戳应为 HH:MM:SS.mmm 本地格式，实际 {stamp}");
+    }
+
+    fn regex_shape(s: &str) -> bool {
+        let bytes = s.as_bytes();
+        bytes.len() == 12
+            && bytes[2] == b':'
+            && bytes[5] == b':'
+            && bytes[8] == b'.'
+            && (0..12)
+                .filter(|i| ![2, 5, 8].contains(i))
+                .all(|i| bytes[i].is_ascii_digit())
     }
 }
