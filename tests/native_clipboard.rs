@@ -99,7 +99,15 @@ fn run_native_test() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         assert_eq!(meta["image"]["width"], 2);
         assert_eq!(meta["image"]["height"], 2);
-        assert_eq!(meta["image"]["mime"], "image/x-rgba");
+        // X11 后端读取剪贴板里真实的 image/png target；Windows/macOS 后端直接
+        // 对 arboard 解码出的 RGBA 像素求摘要，标记为 image/x-rgba。两者都是
+        // 图片被完整捕获的有效表示，按平台分别校验。
+        let expected_mime = if cfg!(target_os = "linux") {
+            "image/png"
+        } else {
+            "image/x-rgba"
+        };
+        assert_eq!(meta["image"]["mime"], expected_mime);
         Ok::<(), Box<dyn std::error::Error>>(())
     })();
     if let Err(err) = result {
