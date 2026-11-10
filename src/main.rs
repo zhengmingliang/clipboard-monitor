@@ -38,7 +38,7 @@ fn real_main() -> Result<()> {
     }
     let cmd = match args.first().map(|s| s.as_str()) {
         Some("serve") | Some("start") | Some("stop") | Some("status") | Some("cleanup")
-        | Some("autostart") | Some("service") => args.remove(0),
+        | Some("autostart") | Some("service") | Some("export") | Some("import") => args.remove(0),
         _ => "serve".to_string(),
     };
     // autostart/service 有自己的子动作，不复用通用 parse_opts。
@@ -61,11 +61,37 @@ fn real_main() -> Result<()> {
         "cleanup" => cleanup_cli(&opt),
         "autostart" => autostart_cli(&action),
         "service" => service_cli(&action),
+        "export" => export_cli(&opt),
+        "import" => import_cli(&opt),
         _ => {
             print_help();
             Ok(())
         }
     }
+}
+
+fn export_cli(opt: &Opt) -> Result<()> {
+    let db = Database::open_encrypted(&opt.data_dir.join("monitor.db"))?;
+    if let Some(path) = &opt.output {
+        let mut file = open_private(Path::new(path), false)?;
+        let n = clipboard_monitor::backup::export_to(&db, &mut file)?;
+        println!("已导出 {n} 条到 {path}");
+    } else {
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        clipboard_monitor::backup::export_to(&db, &mut lock)?;
+    }
+    Ok(())
+}
+
+fn import_cli(opt: &Opt) -> Result<()> {
+    let input = opt.input.as_deref().context("import 需要 --input 文件")?;
+    let file = fs::File::open(input).with_context(|| format!("打开 {input} 失败"))?;
+    let mut db = Database::open_encrypted(&opt.data_dir.join("monitor.db"))?;
+    let (ok, skipped) =
+        clipboard_monitor::backup::import_from(&mut db, std::io::BufReader::new(file))?;
+    println!("已导入 {ok} 条，跳过 {skipped} 条（生成新 id，未覆盖现有记录）");
+    Ok(())
 }
 
 fn autostart_cli(action: &str) -> Result<()> {
@@ -159,6 +185,8 @@ struct Opt {
     to: Option<String>,
     content_type: Option<String>,
     op: Option<String>,
+    output: Option<String>,
+    input: Option<String>,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opt> {
@@ -169,6 +197,8 @@ fn parse_opts(args: &[String]) -> Result<Opt> {
     let mut to = None;
     let mut content_type = None;
     let mut op = None;
+    let mut output = None;
+    let mut input = None;
     let mut i = 0;
     while i < args.len() {
         let key = args[i].as_str();
@@ -181,6 +211,8 @@ fn parse_opts(args: &[String]) -> Result<Opt> {
             "--to" => to = Some(need(key, val)?),
             "--type" => content_type = Some(need(key, val)?),
             "--op" => op = Some(need(key, val)?),
+            "--output" => output = Some(need(key, val)?),
+            "--input" => input = Some(need(key, val)?),
             other if other.starts_with('-') => bail!("未知参数 {other}"),
             other => bail!("多余参数 {other}"),
         }
@@ -202,6 +234,8 @@ fn parse_opts(args: &[String]) -> Result<Opt> {
         to,
         content_type,
         op,
+        output,
+        input,
     })
 }
 
@@ -431,6 +465,8 @@ fn open_private(path: &Path, append: bool) -> Result<std::fs::File> {
     options.create(true).read(true).write(true);
     if append {
         options.append(true);
+    } else {
+        options.truncate(true);
     }
     #[cfg(unix)]
     options.mode(0o600);
@@ -676,11 +712,14 @@ fn print_help() {
   clipboard-monitor cleanup [--data-dir 目录] --from 时间 --to 时间 [--type 类型] [--op read|write]
   clipboard-monitor autostart enable|disable|status
   clipboard-monitor service unit|plist
+  clipboard-monitor export [--output 文件.jsonl] [--data-dir 目录]
+  clipboard-monitor import --input 文件.jsonl [--data-dir 目录]
 
 不带子命令时等价于 serve，在前台运行并打开本机界面。
 autostart 用三平台原生方式配置当前用户开机自启（Linux .desktop /
 macOS LaunchAgents plist / Windows HKCU Run），无需管理员权限。
 service 只打印 systemd user unit 或 launchd plist 内容，不写系统目录。
+export 导出解密后的 JSONL（不指定 --output 则写到 stdout），import 导入并生成新 id。
 默认界面 http://127.0.0.1:27890
 默认目录遵循 Windows/macOS/Linux 系统规范，详见 README。
 也可用 --data-dir 和 --config 显式指定。

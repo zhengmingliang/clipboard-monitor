@@ -165,6 +165,9 @@ fn run_native_test() -> Result<(), Box<dyn std::error::Error>> {
         let restored = post_json(&format!("{base}/api/events/{restore_id}/restore"), "{}")?;
         assert_eq!(restored["restored"], true, "回写接口应返回 restored=true");
         assert_eq!(clipboard.get_text()?, token, "系统剪贴板应恢复成历史正文");
+
+        // 统计 / JSONL 导出端点（放在最后，此时至少已有文本与图片事件）。
+        verify_new_endpoints(&base, &token)?;
         Ok::<(), Box<dyn std::error::Error>>(())
     })();
 
@@ -197,8 +200,10 @@ fn verify_capabilities(base: &str) -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(caps["text"], true);
     assert_eq!(caps["image"], true);
     if cfg!(target_os = "linux") {
-        assert_eq!(caps["reads"], true, "X11 应声明可靠读取");
-        assert_eq!(caps["primary"], true);
+        // Linux 上运行时可能是 X11（CI 用 Xvfb）或 Wayland；Wayland 无读取审计。
+        let wayland = status["backend"].as_str() == Some("wayland");
+        assert_eq!(caps["reads"], !wayland, "读取能力应与实际后端一致");
+        assert_eq!(caps["primary"], !wayland);
         assert_eq!(caps["source_info"], false);
         assert_eq!(caps["reads_inferred"], false);
     } else {
@@ -212,6 +217,29 @@ fn verify_capabilities(base: &str) -> Result<(), Box<dyn std::error::Error>> {
             "只有 Windows 声明推断读取"
         );
     }
+    assert_eq!(status["encrypted"], true, "生产数据库必须启用正文加密");
+    assert_eq!(status["full_text_search"], true);
+    Ok(())
+}
+
+/// 校验新增端点（统计 / JSONL 导出）在真实进程上可用且返回约定结构。
+fn verify_new_endpoints(base: &str, token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let analytics = get_json(&format!("{base}/api/analytics?days=7"))?;
+    assert_eq!(analytics["days"], 7);
+    assert!(analytics["by_hour"]
+        .as_array()
+        .is_some_and(|a| a.len() == 24));
+    assert!(analytics["total"].as_i64().unwrap_or(0) >= 1);
+    assert!(analytics["daily"].as_array().is_some_and(|a| !a.is_empty()));
+
+    let export = get_text(&format!("{base}/api/export"))?;
+    let mut lines = export.lines();
+    let header: Value = serde_json::from_str(lines.next().ok_or("导出为空")?)?;
+    assert_eq!(header["format"], "clipboard-monitor-jsonl");
+    assert_eq!(header["version"], 1);
+    assert_eq!(header["encrypted"], true);
+    let joined = lines.collect::<Vec<_>>().join("\n");
+    assert!(joined.contains(token), "JSONL 导出必须包含解密后的正文");
     Ok(())
 }
 
@@ -340,6 +368,25 @@ fn wait_event(
 
 /// 写接口需要 Content-Type: application/json（同源校验由浏览器头保证，
 /// 这里直连回环地址不带 Origin，服务端按同源放行）。
+/// 读取原始文本响应（用于 JSONL 导出等非单一 JSON 的端点）。
+fn get_text(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let rest = url.trim_start_matches("http://");
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let mut stream = std::net::TcpStream::connect(host)?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    write!(
+        stream,
+        "GET /{path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|parts| parts.1)
+        .ok_or("HTTP 响应没有正文")?;
+    Ok(body.to_string())
+}
+
 fn post_json(url: &str, body: &str) -> Result<Value, Box<dyn std::error::Error>> {
     let rest = url.trim_start_matches("http://");
     let (host, path) = rest.split_once('/').unwrap_or((rest, ""));

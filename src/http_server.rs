@@ -366,6 +366,17 @@ fn dispatch(app: &App, method: &str, path: &str, query: &str, body: &[u8]) -> Re
         let (rows, total) = db.query_events(&filter, limit, offset)?;
         return Ok(json_ok(json!({"total": total, "events": rows})));
     }
+    if method == "GET" && path == "/api/export" {
+        let db = app.db.lock().unwrap_or_else(|e| e.into_inner());
+        let mut body = Vec::new();
+        crate::backup::export_to(&db, &mut body)?;
+        return Ok(Response {
+            status: 200,
+            content_type: "application/x-ndjson; charset=utf-8",
+            body,
+            content_disposition: Some(content_disposition("clipboard-monitor-export.jsonl")),
+        });
+    }
     if method == "GET" && path == "/api/analytics" {
         let days = parse_query(query)
             .get("days")

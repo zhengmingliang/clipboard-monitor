@@ -131,6 +131,17 @@ Windows 用 `autostart enable`（HKCU Run）即可；`service` 不提供 Windows
 
 搜索框由 SQLite **FTS5**（`trigram` 分词，索引解密后的明文）驱动，支持中文子串与英文单词；≥3 字符的查询走全文索引，短查询退回应用名/格式的 `LIKE` 匹配。索引随写入增量维护，迁移后自动重建。
 
+### 导出与备份
+
+「清理」页提供「下载 JSONL 备份」，也可用命令行：
+
+```bash
+./target/release/clipboard-monitor export --output backup.jsonl
+./target/release/clipboard-monitor import --input backup.jsonl
+```
+
+导出是**解密后的明文**（每行一条事件，含 `body` / `meta_json` / `sha256`，图片 blob 以 base64 放在 `blob_b64`），首行是带 `format` / `version` / `encrypted` 的元数据头。`GET /api/export` 提供同样内容。**导出文件本身不加密，请妥善保管**。导入按行解析、跳过格式不匹配的行，生成新的 id、不覆盖现有记录，也不会破坏现有加密密钥；适合迁移与审计，不适合增量同步。
+
 | 字段 | 默认 | 含义 |
 | --- | --- | --- |
 | `listen` | `127.0.0.1:27890` | 界面地址，修改后重启进程 |
@@ -221,7 +232,7 @@ CI 在五个原生架构上按同一份契约校验，平台专有能力单独�
 | 6 | API 契约 | `/api/events`、`/api/events/{id}`、`/api/status` 的字段集合与类型一致；`capabilities` 必须与实际能力相符，不得谎报 | `reads`/`primary` 仅 X11 为真；`source_info`/`formats` 在 Win/mac 为真；`reads_inferred` 仅 Windows 为真 |
 | 7 | 清理与保留期 | `keep_content_ids()` 正确保护当前快照；手动清理拒绝无条件删除；事务化落库不产生孤儿 contents | 无平台差异 |
 
-**验收方式**：`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets -- -D warnings`（CI 五个 target 各跑一次）、`cargo test --locked --all-targets`（含平台无关的观察契约单测），以及 `CLIPBOARD_MONITOR_NATIVE_LIVE=1 cargo test --release --test native_clipboard -- --ignored`（五架构真实剪贴板，覆盖文本/图片写入、去重、清空语义、元数据、能力声明，并在结束时恢复原剪贴板）。Linux/X11 另有 `CLIPBOARD_MONITOR_LIVE=1 cargo test --test flow` 验证读写流转链。
+**验收方式**：`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets -- -D warnings`（CI 五个 target 各跑一次）、`cargo test --locked --all-targets`（含平台无关的观察契约单测），以及 `CLIPBOARD_MONITOR_NATIVE_LIVE=1 cargo test --release --test native_clipboard -- --ignored`（五架构真实剪贴板，覆盖文本/图片写入、去重、清空语义、元数据、加密/FTS 能力声明、回写往返、统计与 JSONL 导出端点，并在结束时恢复原剪贴板）。Linux/X11 另有 `CLIPBOARD_MONITOR_LIVE=1 cargo test --test flow` 验证读写流转链。
 
 ## 自动构建与 Releases
 

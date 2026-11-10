@@ -55,7 +55,8 @@
     cursor: pointer;
     font: inherit;
   }
-  button.primary { background: #1f6feb; border-color: #1f6feb; }
+  button.primary, a.button { background: #1f6feb; border-color: #1f6feb; }
+  a.button { display: inline-block; padding: 6px 12px; border: 1px solid var(--line); border-radius: 7px; color: #fff; text-decoration: none; font-size: 13px; }
   button.danger { background: #7d2b31; border-color: #7d2b31; }
   button:disabled { opacity: .55; cursor: default; }
   nav { display: flex; gap: 6px; padding: 10px 22px 0; }
@@ -296,6 +297,11 @@
         <button id="c-run" class="danger">执行清理</button>
         <span id="c-msg" class="note"></span>
       </p>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <h3 style="margin:0 0 8px;font-size:14px">导出备份</h3>
+      <p>把所有记录导出为 JSONL（每行一条事件，含<strong>解密后的明文正文</strong>与 base64 图片）。导出文件本身不加密，请妥善保管。命令行可用 <code>clipboard-monitor export --output 文件</code> 与 <code>import --input 文件</code> 迁移。</p>
+      <p><a class="button" href="/api/export" download="clipboard-monitor-export.jsonl">下载 JSONL 备份</a></p>
     </div>
   </section>
 
