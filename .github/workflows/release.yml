@@ -61,8 +61,12 @@ jobs:
           sudo apt-get install -y xvfb
 
       - name: Install Rust
+        # 版本与仓库根目录 rust-toolchain.toml 保持一致：固定工具链，
+        # 避免上游 stable 升级引入新 clippy lint 打断发布。
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.93.1"
+          components: rustfmt, clippy
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo build

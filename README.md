@@ -32,7 +32,7 @@ Windows 的 `capabilities.reads_inferred=true` 是**尽力而为的推断**，�
 
 ## 构建
 
-安装当前稳定版 Rust 工具链后：
+仓库根目录的 `rust-toolchain.toml` 固定了 Rust 版本（含 rustfmt/clippy 组件），`rustup` 会自动安装；CI 的 `dtolnay/rust-toolchain` 也显式使用同一版本。固定工具链是为了让 fmt/clippy 在五个原生 runner 与本地可复现 —— 上游 stable 悄悄升级曾引入新 lint 打断过发布。升级版本时请同时改这两处，并先在本地跑过 `just check`。
 
 ```bash
 cargo build --release --locked

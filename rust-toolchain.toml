@@ -1,0 +1,7 @@
+# 固定工具链，保证 fmt/clippy 行为在五个原生 runner 与本地可复现。
+# 升级时由维护者显式改这里，并在本地跑过 just check 后再推送，
+# 避免上游 stable 悄悄升级引入新 lint 打断发布（历史上发生过一次）。
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

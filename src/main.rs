@@ -224,6 +224,8 @@ fn serve(opt: Opt) -> Result<()> {
     write_pid(&opt.data_dir)?;
     let threads = monitor::spawn(Arc::clone(&app))?;
     install_signals()?;
+    #[cfg(target_os = "windows")]
+    stop_event::install(&opt.data_dir)?;
     log_info(format!(
         "数据目录 {} ，配置 {}",
         opt.data_dir.display(),
@@ -325,8 +327,25 @@ fn stop_daemon(opt: &Opt) -> Result<()> {
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
     }
+    // Windows：先发命名事件让进程优雅退出（走 WAL checkpoint），3 秒内
+    // 没退再强杀兜底。事件不存在（旧版本进程）时直接强杀。
     #[cfg(target_os = "windows")]
-    terminate_process(pid)?;
+    {
+        let signaled = stop_event::signal(&opt.data_dir).unwrap_or(false);
+        if signaled {
+            let graceful = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < graceful {
+                if !pid_exists(pid) {
+                    remove_pid(&opt.data_dir);
+                    println!("已停止（优雅退出）");
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            println!("优雅退出超时，改为强制结束");
+        }
+        terminate_process(pid)?;
+    }
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         if !pid_exists(pid) {
@@ -550,6 +569,73 @@ fn terminate_process(pid: u32) -> Result<()> {
 fn install_signals() -> Result<()> {
     ctrlc::set_handler(|| STOP.store(true, Ordering::Relaxed)).context("安装退出信号处理")?;
     Ok(())
+}
+
+/// Windows 优雅停止：用按数据目录派生命名的事件通知 serve 进程自行退出，
+/// 让它走完 monitor::shutdown（线程 join + SQLite WAL checkpoint）而不是
+/// 被 TerminateProcess 强杀。事件名在 Local\ 命名空间，按用户隔离、无需
+/// 管理员权限；打开失败（例如进程刚退出）会回退到强杀。
+#[cfg(target_os = "windows")]
+mod stop_event {
+    use anyhow::Result;
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
+    };
+
+    fn event_name(dir: &Path) -> Vec<u16> {
+        let tag = clipboard_monitor::classify::sha256_hex(dir.to_string_lossy().as_bytes());
+        format!("Local\\clipboard-monitor-stop-{}", &tag[..16])
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    /// serve 进程调用：创建事件并起一个等待线程，事件被置位时设 STOP。
+    pub fn install(dir: &Path) -> Result<()> {
+        let name = event_name(dir);
+        let handle = unsafe {
+            CreateEventW(
+                std::ptr::null(),
+                1, // manual reset
+                0, // non-signaled
+                name.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            anyhow::bail!("创建停止事件失败: {}", std::io::Error::last_os_error());
+        }
+        let raw = handle as usize;
+        std::thread::Builder::new()
+            .name("clip-stop-event".into())
+            .spawn(move || {
+                let h = raw as HANDLE;
+                // 无限等待；进程退出时线程随之中止，句柄由 OS 回收。
+                let r = unsafe { WaitForSingleObject(h, u32::MAX) };
+                if r == WAIT_OBJECT_0 {
+                    super::STOP.store(true, Ordering::Relaxed);
+                }
+                unsafe { CloseHandle(h) };
+            })?;
+        Ok(())
+    }
+
+    /// stop 命令调用：给目标进程发优雅退出信号。返回是否成功通知到。
+    pub fn signal(dir: &Path) -> Result<bool> {
+        let name = event_name(dir);
+        let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Ok(false); // 事件不存在（旧版本进程 / 已退出），回退强杀
+        }
+        let ok = unsafe { SetEvent(handle) };
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            anyhow::bail!("设置停止事件失败: {}", std::io::Error::last_os_error());
+        }
+        Ok(true)
+    }
 }
 
 static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
