@@ -9,6 +9,7 @@
 | Windows | `WM_CLIPBOARDUPDATE` + `GetClipboardSequenceNumber` 廉价预检，内容摘要兜底 | Unicode 文本 | 系统图片记录尺寸与完整摘要 | 内容/清空/格式/序号变化区分；格式清单；剪贴板所有者 → PID / 进程路径；前台触发主体；`GetOpenClipboardWindow` 轮询 + Ctrl+V 钩子交叉推断的**推断读取** |
 | macOS | `NSPasteboard.changeCount` 快速路径 + 最多每 2 秒内容摘要采样兜底（无窗口会话兼容） | Unicode 文本 | TIFF 等系统图片记录尺寸与完整摘要 | 内容/清空/格式/序号变化区分；格式清单；前台应用 PID / 名称 / 路径 |
 | Linux/X11 | XFixes 事件，空闲时不轮询内容 | 纯文本、富文本 | PNG/JPEG/GIF/WebP/BMP 等格式元数据 | PRIMARY（默认关闭，见 `monitor_primary`）、XRes 来源进程、ConvertSelection **可靠**读取审计、读写流转链 |
+| Linux/Wayland | `ext-data-control-v1` 的 selection 事件（需 compositor 授权绑定） | UTF-8 文本 | 图片格式元数据 | 格式清单；**无**读取审计、**无**来源进程、**无** PRIMARY（默认） |
 
 **事件语义（三平台一致）**：`op` 只有 `write` / `read` 两种。写入事件的 `reason` 区分 `snapshot`（启动快照）、`content_change`、`cleared`、`format_change`（内容相同但格式集合变了）、`sequence_change`（内容与格式相同但 OS 变更序号变了）、`reenabled`（暂停后恢复）；X11 另有 `owner_change` / `window_destroy` / `client_close`。快速连续复制 A→B→A 不会被最终状态吞掉。所有事件在 `meta_json.change` 里带判定依据，`meta_json.formats` / `sequence` 记录格式清单与 OS 序号。
 
@@ -25,7 +26,7 @@ Windows 的 `capabilities.reads_inferred=true` 是**尽力而为的推断**，�
 
 **白名单三平台生效**：命中白名单的程序，其剪贴板正文零落盘（不产生 contents / events 行），与 Linux/X11 行为一致。`wm_class` 匹配只在 X11 有意义，其它平台按进程名、可执行文件名/全路径、PID 匹配。
 
-原生 Wayland 客户端不在当前 Linux/X11 后端能力范围内；XWayland 上只能看到走 X11 的程序。
+**Linux 后端自动选择**：启动时若检测到 `WAYLAND_DISPLAY` 且 compositor 提供 `ext_data_control_manager_v1` 全局，使用 Wayland 后端；否则回退 X11/XWayland（`/api/status` 的 `backend` 显示实际生效者）。Wayland 是"特权客户端"协议，KDE/sway 等通常可用，GNOME 可能只允许内置剪贴板管理器而拒绝绑定 —— 绑定失败会自动回退 X11，不会导致启动失败。`capabilities.reads` 与 `capabilities.primary` 在 Wayland 后端下为 false，**Wayland 下没有读取审计与来源进程归属**，这是协议限制而非实现缺失。原生 Wayland 客户端由此后端覆盖，XWayland 上的程序仍走 X11 后端。
 
 图片只保存格式、尺寸、大小和摘要，不保存像素。Windows/macOS 直接对剪贴板解码出的 RGBA 像素计算完整 SHA-256（宽高参与摘要），不做二次编码。文本小于 1MB 时保存原文，达到 1MB 时只保存大小、摘要和前 4KB。文件列表和文件内容保存规则目前适用于 Linux/X11。
 
@@ -209,13 +210,13 @@ git push origin v1.0.0
 
 ## 已知限制
 
-- Linux 仅支持 X11/XWayland，不支持原生 Wayland data-control。
+- Linux 原生 Wayland 后端依赖 compositor 支持并授权 `ext-data-control-v1`；不支持的 compositor 会自动回退 X11/XWayland。Wayland 后端无读取审计、无来源进程归属、无 PRIMARY 与文件列表。
 - X11 的 PRIMARY 选择区在选中文字时就会写入、中键粘贴时产生读取，开启 `monitor_primary` 后会出现大量由单纯选中操作引发的写入/读取记录；默认已关闭，旧配置里若为 `true` 请在设置中取消勾选。
 - 程序如果在自己的进程里缓存旧内容，不再向 X 服务器请求，就不会产生 X11 读取记录。
 - X11 所有者如果在内容被取走前退出，对应写入会留下“没有取到内容”的说明。
 - Windows/macOS 的 OS 不提供全局读取拦截：Windows 只有 `reason=inferred_read` 的间接推断，macOS 完全没有读取事件；两者都不等价于 X11 的可靠读取审计。
 - Windows/macOS 的内容变化通知不携带内容本身，极短时间内连续多次复制仍可能只采到最终状态；`GetClipboardSequenceNumber` / `changeCount` 快速路径已尽量缩短采样窗口，兜底采样间隔最多约 2 秒。
 - Windows/macOS 不采集 `wm_class`（X11 概念）；macOS 没有窗口句柄概念，`window_id` 恒为 0。延迟渲染下 Windows 的剪贴板所有者不一定是发起复制的线程。
-- Windows/macOS 不保存文件列表/文件内容、富文本与 PRIMARY 选择区；这些仍是 Linux/X11 专属。
+- Windows/macOS/Wayland 不保存文件列表/文件内容与富文本；PRIMARY 与文件列表仍是 Linux/X11 专属。
 - Windows 的 `stop` 命令用 `TerminateProcess` 结束后台进程，不会执行 Unix 那样的优雅退出与 SQLite WAL checkpoint；WAL 本身持久有效，下次启动会正常恢复，记录不会丢失。
 - 同一次 X11 粘贴可能请求多个格式，300ms 内同一程序对同一选择区的读取会合并成一条。

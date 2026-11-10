@@ -479,7 +479,7 @@ fn status_json(app: &App) -> Result<Value> {
         "pid": app.self_pid,
         "listen": listen,
         "display": if cfg!(target_os = "linux") { std::env::var("DISPLAY").unwrap_or_default() } else { String::new() },
-        "backend": crate::monitor::BACKEND,
+        "backend": crate::monitor::active_backend(),
         "changes_ready": app.changes_ok.load(Ordering::Relaxed),
         "encrypted": db.is_encrypted(),
         "full_text_search": true,
@@ -488,8 +488,8 @@ fn status_json(app: &App) -> Result<Value> {
             "image": true,
             // 只有 X11 能通过 RECORD 可靠审计读取；其它平台不要把推断
             // 读取混同为可靠读取。
-            "reads": crate::monitor::SUPPORTS_READS,
-            "primary": crate::monitor::SUPPORTS_PRIMARY,
+            "reads": crate::monitor::supports_reliable_reads(),
+            "primary": crate::monitor::supports_primary(),
             "source_info": crate::monitor::SUPPORTS_SOURCE_INFO,
             "reads_inferred": crate::monitor::SUPPORTS_INFERRED_READS,
             "formats": crate::monitor::SUPPORTS_FORMATS,

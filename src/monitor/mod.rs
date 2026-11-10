@@ -2,12 +2,12 @@
 //!
 //! Linux 保留 X11 事件管线；Windows 和 macOS 由各自原生后端检测变化。
 
-#[cfg(any(target_os = "windows", target_os = "macos", test))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
 use crate::classify::Captured;
 use crate::classify::Limits;
 use crate::config::Config;
 use crate::db::Database;
-#[cfg(any(target_os = "windows", target_os = "macos", test))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
 use crate::db::NewEvent;
 use crate::{log_info, log_warn};
 use anyhow::Result;
@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 pub mod observation;
 
 #[cfg(target_os = "linux")]
-mod x11;
+mod wayland;
 #[cfg(target_os = "linux")]
-use x11 as backend;
+mod x11;
 
 #[cfg(any(target_os = "windows", target_os = "macos", test))]
 mod portable;
@@ -190,6 +190,77 @@ impl App {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    /// Wayland 后端专用：直接把一次观察写入 `op="write"` 事件。
+    ///
+    /// ext-data-control 没有窗口/进程归属，也不提供读取审计，因此来源字段
+    /// 显式留空；`meta_json.change` 与 `meta_json.formats` 仍写明判定依据与
+    /// 格式清单。与 X11 后端共用 `events` 表结构与 `insert_event`。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn record_wayland_change(
+        &self,
+        obs: &crate::monitor::observation::ClipboardObservation,
+        spec: &crate::monitor::observation::EventSpec,
+        ts_ms: i64,
+    ) -> Result<i64> {
+        let captured = &obs.body;
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&captured.meta_json).unwrap_or_else(|_| serde_json::json!({}));
+        meta["change"] = spec.change_meta();
+        if !obs.formats.is_empty() {
+            meta["formats"] = serde_json::json!(obs.formats);
+        }
+        let enriched = Captured {
+            meta_json: meta.to_string(),
+            ..captured.clone()
+        };
+        let mut db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        let (content_id, _event_id) = db.insert_change(
+            &enriched,
+            &NewEvent {
+                ts_ms,
+                op: spec.op.into(),
+                selection: "CLIPBOARD".into(),
+                pid: None,
+                app_name: String::new(),
+                wm_class: String::new(),
+                exec_path: String::new(),
+                window_id: 0,
+                content_id: None,
+                content_type: captured.content_type.clone(),
+                content_size: captured.size,
+                summary: captured.summary.clone(),
+                targets: obs.formats.join(", "),
+                source_app: String::new(),
+                source_pid: None,
+                source_event_id: None,
+                truncated: captured.truncated,
+                x_time: 0,
+                reason: spec.reason.into(),
+                pending: false,
+            },
+            ts_ms,
+        )?;
+        drop(db);
+        self.snaps.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            "CLIPBOARD".into(),
+            Snap {
+                content_id: Some(content_id),
+                event_id: None,
+                source_app: String::new(),
+                source_pid: None,
+                owner: 0,
+                summary: captured.summary.clone(),
+                content_type: captured.content_type.clone(),
+                size: captured.size,
+                truncated: captured.truncated,
+                targets: obs.formats.join(", "),
+            },
+        );
+        self.counters.writes.fetch_add(1, Ordering::Relaxed);
+        self.counters.last_event_ms.store(ts_ms, Ordering::Relaxed);
+        Ok(content_id)
     }
 
     /// 非 X11 后端已经取得完整内容，按观察契约写入一条变化记录。
@@ -464,13 +535,61 @@ pub struct Threads {
 }
 
 pub fn spawn(app: Arc<App>) -> Result<Threads> {
+    #[cfg(target_os = "linux")]
+    let mut joins = {
+        // 运行时选择：Wayland 会话且 compositor 提供 ext-data-control 时用它，
+        // 否则回退 X11/XWayland。probe 只读，不修改系统状态。
+        if wayland::probe() {
+            crate::log_info("检测到 Wayland + ext-data-control，使用 Wayland 后端");
+            wayland::spawn(Arc::clone(&app))?
+        } else {
+            x11::spawn(Arc::clone(&app))?
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
     let mut joins = backend::spawn(Arc::clone(&app))?;
+
     let clean_app = Arc::clone(&app);
     let cleaner = thread::Builder::new()
         .name("clip-cleanup".into())
         .spawn(move || cleanup_loop(clean_app))?;
     joins.push(cleaner);
     Ok(Threads { joins })
+}
+
+/// 当前生效的后端名（Linux 上运行时决定，其它平台为编译期常量）。
+pub fn active_backend() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        if wayland::is_active() {
+            return "wayland";
+        }
+    }
+    BACKEND
+}
+
+/// 当前后端是否提供可靠的读取审计（X11 RECORD；Wayland 不提供）。
+pub fn supports_reliable_reads() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        !wayland::is_active()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// 当前后端是否支持 PRIMARY 选择区（Wayland 默认关闭，X11 可配置）。
+pub fn supports_primary() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        !wayland::is_active()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 pub fn shutdown(app: &App, threads: Threads) {

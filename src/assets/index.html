@@ -290,7 +290,7 @@
   <section id="tab-help" class="hidden">
     <div class="panel">
       <h2>这是什么</h2>
-      <p>它记录本机剪贴板的文本与图片变化，日志留在本地 SQLite，不上传。Linux/X11 还支持来源进程、PRIMARY 选择区和读取审计。</p>
+      <p>它记录本机剪贴板的文本与图片变化，日志留在本地 SQLite，不上传。Linux/X11 支持来源进程、PRIMARY 选择区和读取审计；Linux/Wayland 通过 ext-data-control 记录内容变化，但没有读取审计与来源进程归属。</p>
       <h2>平台差异</h2>
       <p>Windows 使用 WM_CLIPBOARDUPDATE 通知 + 序号预检；macOS 用 changeCount 快速路径并以最多每 2 秒的内容摘要采样兜底；Linux 使用 XFixes/RECORD，只有它能可靠审计读取。</p>
       <p><strong>Windows 的「推断读取」</strong>：Win32 在读取粘贴时不发任何通知。本程序用「其它进程打开剪贴板且序号未变」的轮询 + Ctrl+V 低级键盘钩子交叉推断，事件标为 <code>reason=inferred_read</code>、摘要里带判定依据。它是尽力而为的估计：菜单粘贴、极短读取可能漏掉，剪贴板管理器同步也可能被算作读取，<strong>不等价于可靠的全局读取审计</strong>。macOS 不产生读取事件。</p>
@@ -434,7 +434,7 @@ async function refreshStatus() {
   const db = s.db || {};
   $("dbpill").textContent = `${db.db_human || ""} / ${s.max_db_human || ""}`;
   const err = s.last_error ? ` · ${s.last_error}` : "";
-  const backend = { x11: "Linux/X11", windows: "Windows", macos: "macOS" }[s.backend] || s.backend;
+  const backend = { x11: "Linux/X11", wayland: "Linux/Wayland", windows: "Windows", macos: "macOS" }[s.backend] || s.backend;
   const reads = state.capabilities.reads ? ` · 读取 ${s.reads_seen}` : (state.capabilities.reads_inferred ? ` · 推断读取 ${s.reads_seen}` : "");
   const security = `${s.encrypted ? " · 正文已加密" : " · 正文未加密"}${s.full_text_search ? " · 全文检索" : ""}`;
   $("meta").textContent =
