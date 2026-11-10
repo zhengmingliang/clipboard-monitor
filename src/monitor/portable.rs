@@ -18,7 +18,7 @@ use std::sync::Arc;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::thread::{self, JoinHandle};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(super) fn spawn(app: Arc<App>) -> Result<Vec<JoinHandle<()>>> {
@@ -141,22 +141,21 @@ fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>> {
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
-    use objc2_app_kit::NSPasteboard;
 
     pub(super) fn run(app: Arc<App>) {
-        let pasteboard = NSPasteboard::generalPasteboard();
-        let mut last_count = pasteboard.changeCount();
-        let mut was_enabled = false;
-        let mut last_hash = None;
         app.changes_ok.store(true, Ordering::Relaxed);
         log_info("macOS 剪贴板监听已启动（NSPasteboard.changeCount）");
+        let mut was_enabled = false;
+        let mut last_hash = None;
+        let mut last_probe = Instant::now() - Duration::from_secs(1);
         while !app.shutdown.load(Ordering::Relaxed) {
-            let count = pasteboard.changeCount();
-            let changed = count != last_count;
-            last_count = count;
             let enabled = app.enabled.load(Ordering::Relaxed);
-            if enabled && (!was_enabled || changed) {
+            let overdue = last_probe.elapsed() >= Duration::from_secs(2);
+            if enabled && (!was_enabled || overdue) {
+                // NSPasteboard.changeCount 在部分无窗口会话中不递增，
+                // 因而用低频内容摘要兜底；正常路径仍由变化计数驱动。
                 capture_and_record(&app, &mut last_hash);
+                last_probe = Instant::now();
             }
             was_enabled = enabled;
             thread::sleep(Duration::from_millis(200));
