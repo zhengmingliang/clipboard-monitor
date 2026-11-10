@@ -178,7 +178,8 @@ impl Database {
             std::fs::create_dir_all(dir)?;
             restrict_dir(dir);
         }
-        let conn = Connection::open(path).with_context(|| format!("打开数据库 {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("打开数据库 {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         // auto_vacuum 只在建库时生效。新文件上，这条语句先于任何表。
         let _ = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0));
@@ -285,6 +286,7 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_read_burst(
         &self,
         id: i64,
@@ -338,14 +340,21 @@ impl Database {
         Ok(())
     }
 
-    pub fn query_events(&self, filter: &EventFilter, limit: i64, offset: i64) -> Result<(Vec<EventRow>, i64)> {
+    pub fn query_events(
+        &self,
+        filter: &EventFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<EventRow>, i64)> {
         let (where_sql, args) = filter_clause(filter);
         let count_sql = format!(
             "SELECT COUNT(*) FROM events e LEFT JOIN contents c ON c.id = e.content_id {where_sql}"
         );
-        let total: i64 = self
-            .conn
-            .query_row(&count_sql, rusqlite::params_from_iter(args.iter()), |r| r.get(0))?;
+        let total: i64 =
+            self.conn
+                .query_row(&count_sql, rusqlite::params_from_iter(args.iter()), |r| {
+                    r.get(0)
+                })?;
         let mut args = args;
         args.push(limit.to_string());
         args.push(offset.to_string());
@@ -431,7 +440,10 @@ impl Database {
         }
         if let Some(cid) = content_id {
             args.push(cid);
-            conds.push(format!("(e.content_id = ?{} AND e.content_id IS NOT NULL)", args.len()));
+            conds.push(format!(
+                "(e.content_id = ?{} AND e.content_id IS NOT NULL)",
+                args.len()
+            ));
         }
         args.push(READ_LIMIT + 1);
         let limit_idx = args.len();
@@ -535,8 +547,12 @@ impl Database {
     }
 
     pub fn stats(&self) -> Result<DbStats> {
-        let events: i64 = self.conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
-        let contents: i64 = self.conn.query_row("SELECT COUNT(*) FROM contents", [], |r| r.get(0))?;
+        let events: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
+        let contents: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM contents", [], |r| r.get(0))?;
         let day_ago = crate::now_ms() - 86_400_000;
         let reads_24h: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM events WHERE op='read' AND ts_ms >= ?1",
@@ -549,9 +565,11 @@ impl Database {
             |r| r.get(0),
         )?;
         let oldest_ms: Option<i64> =
-            self.conn.query_row("SELECT MIN(ts_ms) FROM events", [], |r| r.get(0))?;
+            self.conn
+                .query_row("SELECT MIN(ts_ms) FROM events", [], |r| r.get(0))?;
         let newest_ms: Option<i64> =
-            self.conn.query_row("SELECT MAX(ts_ms) FROM events", [], |r| r.get(0))?;
+            self.conn
+                .query_row("SELECT MAX(ts_ms) FROM events", [], |r| r.get(0))?;
         let db_bytes = self.file_size();
         Ok(DbStats {
             events,
@@ -588,17 +606,22 @@ impl Database {
             filter.op = None;
         }
         let (where_sql, args) = filter_clause(&filter);
-        let count_sql = format!("SELECT COUNT(*) FROM events e LEFT JOIN contents c ON c.id = e.content_id {where_sql}");
-        let matched: i64 = self
-            .conn
-            .query_row(&count_sql, rusqlite::params_from_iter(args.iter()), |r| r.get(0))?;
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM events e LEFT JOIN contents c ON c.id = e.content_id {where_sql}"
+        );
+        let matched: i64 =
+            self.conn
+                .query_row(&count_sql, rusqlite::params_from_iter(args.iter()), |r| {
+                    r.get(0)
+                })?;
         if spec.dry_run {
             return Ok(matched as u64);
         }
         let delete_sql = format!(
             "DELETE FROM events WHERE id IN (SELECT e.id FROM events e LEFT JOIN contents c ON c.id = e.content_id {where_sql})"
         );
-        self.conn.execute(&delete_sql, rusqlite::params_from_iter(args.iter()))?;
+        self.conn
+            .execute(&delete_sql, rusqlite::params_from_iter(args.iter()))?;
         self.delete_orphans(&[])?;
         self.reclaim()?;
         Ok(matched as u64)
@@ -611,7 +634,10 @@ impl Database {
         keep_contents: &[i64],
     ) -> Result<(u64, u64)> {
         let cutoff = crate::now_ms() - i64::from(retention_days) * 86_400_000;
-        let expired = self.conn.execute("DELETE FROM events WHERE ts_ms < ?1", params![cutoff])? as u64;
+        let expired = self
+            .conn
+            .execute("DELETE FROM events WHERE ts_ms < ?1", params![cutoff])?
+            as u64;
         self.delete_orphans(keep_contents)?;
         let mut trimmed = 0u64;
         for _ in 0..40 {
@@ -669,7 +695,8 @@ impl Database {
     }
 }
 
-const EVENT_COLS: &str = "e.id, e.ts_ms, e.op, e.selection, e.pid, e.app_name, e.wm_class, e.exec_path,
+const EVENT_COLS: &str =
+    "e.id, e.ts_ms, e.op, e.selection, e.pid, e.app_name, e.wm_class, e.exec_path,
     e.window_id, e.content_id, e.content_type, e.content_size, e.summary, e.targets,
     e.source_app, e.source_pid, e.source_event_id, e.truncated, e.reason";
 
@@ -756,11 +783,15 @@ fn filter_clause(filter: &EventFilter) -> (String, Vec<String>) {
 }
 
 fn nonempty(v: &Option<String>) -> Option<String> {
-    v.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    v.as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 pub fn db_file_size(path: &Path) -> u64 {
@@ -899,7 +930,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    fn read_event(db: &Database, ts: i64, app: &str, pid: i32, content_id: i64, source_event_id: Option<i64>) -> i64 {
+    fn read_event(
+        db: &Database,
+        ts: i64,
+        app: &str,
+        pid: i32,
+        content_id: i64,
+        source_event_id: Option<i64>,
+    ) -> i64 {
         db.insert_event(&NewEvent {
             ts_ms: ts,
             op: "read".into(),
@@ -931,7 +969,13 @@ mod tests {
         let write = db.get_event(write_id).unwrap().unwrap();
         let cid = write.event.content_id.unwrap();
         let other = text_event(&db, 1_700_000_000_100, "other-text", TYPE_TEXT);
-        let other_cid = db.get_event(other).unwrap().unwrap().event.content_id.unwrap();
+        let other_cid = db
+            .get_event(other)
+            .unwrap()
+            .unwrap()
+            .event
+            .content_id
+            .unwrap();
 
         let firefox = read_event(&db, 1_700_000_000_200, "firefox", 20, cid, Some(write_id));
         let wechat = read_event(&db, 1_700_000_000_300, "wechat", 30, cid, None);
@@ -939,12 +983,18 @@ mod tests {
 
         let from_write = db.get_event(write_id).unwrap().unwrap().flow;
         assert_eq!(from_write.write.as_ref().map(|h| h.id), Some(write_id));
-        assert_eq!(from_write.reads.iter().map(|h| h.id).collect::<Vec<_>>(), vec![firefox, wechat]);
+        assert_eq!(
+            from_write.reads.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![firefox, wechat]
+        );
         assert_eq!(from_write.reads[0].app_name, "firefox");
         assert_eq!(from_write.reads[1].pid, Some(30));
 
         let from_read = db.get_event(wechat).unwrap().unwrap().flow;
-        assert_eq!(from_read.write.as_ref().map(|h| h.app_name.as_str()), Some("gedit"));
+        assert_eq!(
+            from_read.write.as_ref().map(|h| h.app_name.as_str()),
+            Some("gedit")
+        );
         assert_eq!(from_read.reads.len(), 2);
         let _ = std::fs::remove_file(&path);
     }

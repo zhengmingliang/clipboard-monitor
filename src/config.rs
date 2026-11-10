@@ -116,26 +116,102 @@ impl Config {
         let text = serde_json::to_string_pretty(self)?;
         let tmp = path.with_extension("json.tmp");
         fs::write(&tmp, text + "\n")?;
-        fs::rename(&tmp, path)?;
+        replace_file(&tmp, path)?;
         restrict_file(path);
         Ok(())
     }
 }
 
-pub fn default_config_dir() -> PathBuf {
-    if let Some(dir) = env_path("XDG_CONFIG_HOME") {
-        return dir.join(APP_DIR_NAME);
+#[cfg(not(target_os = "windows"))]
+fn replace_file(source: &Path, destination: &Path) -> Result<()> {
+    fs::rename(source, destination).with_context(|| {
+        format!(
+            "替换配置失败: {} -> {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn replace_file(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let ok = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "替换配置失败: {} -> {}",
+                source.display(),
+                destination.display()
+            )
+        });
     }
-    home_dir().join(".config").join(APP_DIR_NAME)
+    Ok(())
+}
+
+pub fn default_config_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        return env_path("APPDATA")
+            .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"))
+            .join(APP_DIR_NAME);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return home_dir()
+            .join("Library")
+            .join("Application Support")
+            .join(APP_DIR_NAME);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        if let Some(dir) = env_path("XDG_CONFIG_HOME") {
+            return dir.join(APP_DIR_NAME);
+        }
+        home_dir().join(".config").join(APP_DIR_NAME)
+    }
 }
 
 pub fn default_data_dir() -> PathBuf {
-    if let Some(dir) = env_path("XDG_DATA_HOME") {
-        return dir.join(APP_DIR_NAME);
+    #[cfg(target_os = "windows")]
+    {
+        return env_path("LOCALAPPDATA")
+            .unwrap_or_else(|| home_dir().join("AppData").join("Local"))
+            .join(APP_DIR_NAME);
     }
-    home_dir().join(".local").join("share").join(APP_DIR_NAME)
+    #[cfg(target_os = "macos")]
+    {
+        return home_dir()
+            .join("Library")
+            .join("Application Support")
+            .join(APP_DIR_NAME);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        if let Some(dir) = env_path("XDG_DATA_HOME") {
+            return dir.join(APP_DIR_NAME);
+        }
+        home_dir().join(".local").join("share").join(APP_DIR_NAME)
+    }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key).and_then(|v| {
         if v.is_empty() {
@@ -147,25 +223,28 @@ fn env_path(key: &str) -> Option<PathBuf> {
 }
 
 pub fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+    #[cfg(target_os = "windows")]
+    let home = std::env::var_os("USERPROFILE");
+    #[cfg(not(target_os = "windows"))]
+    let home = std::env::var_os("HOME");
+    home.map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(std::env::temp_dir)
 }
 
-pub fn restrict_dir(path: &Path) {
+pub fn restrict_dir(_path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(_path, fs::Permissions::from_mode(0o700));
     }
 }
 
-pub fn restrict_file(path: &Path) {
+pub fn restrict_file(_path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        let _ = fs::set_permissions(_path, fs::Permissions::from_mode(0o600));
     }
 }
 
@@ -298,19 +377,37 @@ fn parse_local_civil(s: &str) -> Option<i64> {
     if !(0..=23).contains(&hour) || !(0..=59).contains(&min) || !(0..=60).contains(&sec) {
         return None;
     }
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    tm.tm_year = year - 1900;
-    tm.tm_mon = month - 1;
-    tm.tm_mday = day;
-    tm.tm_hour = hour;
-    tm.tm_min = min;
-    tm.tm_sec = sec;
-    tm.tm_isdst = -1;
-    let t = unsafe { libc::mktime(&mut tm) };
-    if t < 0 {
+    #[cfg(unix)]
+    {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        tm.tm_year = year - 1900;
+        tm.tm_mon = month - 1;
+        tm.tm_mday = day;
+        tm.tm_hour = hour;
+        tm.tm_min = min;
+        tm.tm_sec = sec;
+        tm.tm_isdst = -1;
+        let t = unsafe { libc::mktime(&mut tm) };
+        if t < 0 {
+            None
+        } else {
+            Some(t * 1000)
+        }
+    }
+    #[cfg(windows)]
+    {
+        let month = time::Month::try_from(month as u8).ok()?;
+        let date = time::Date::from_calendar_date(year, month, day as u8).ok()?;
+        let time = time::Time::from_hms(hour as u8, min as u8, sec.min(59) as u8).ok()?;
+        let offset = time::UtcOffset::current_local_offset().ok()?;
+        let seconds = time::PrimitiveDateTime::new(date, time)
+            .assume_offset(offset)
+            .unix_timestamp();
+        seconds.checked_mul(1000)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
         None
-    } else {
-        Some(t * 1000)
     }
 }
 
@@ -407,6 +504,22 @@ mod tests {
             Some(7),
             ""
         ));
+    }
+
+    #[test]
+    fn saving_replaces_existing_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "clipboard-monitor-config-test-{}-{}",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        let path = dir.join("config.json");
+        let mut config = Config::default();
+        config.save(&path).expect("create config");
+        config.retention_days = 30;
+        config.save(&path).expect("replace config");
+        assert_eq!(Config::load(&path).unwrap().retention_days, 30);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

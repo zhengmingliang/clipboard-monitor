@@ -12,8 +12,8 @@ use clipboard_monitor::monitor::{self, App};
 use clipboard_monitor::{init_log, log_info, now_ms};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::Ordering;
@@ -30,7 +30,9 @@ fn main() {
 
 fn real_main() -> Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.first().map(|s| s.as_str()) == Some("--help") || args.first().map(|s| s.as_str()) == Some("-h") {
+    if args.first().map(|s| s.as_str()) == Some("--help")
+        || args.first().map(|s| s.as_str()) == Some("-h")
+    {
         print_help();
         return Ok(());
     }
@@ -89,18 +91,14 @@ fn parse_opts(args: &[String]) -> Result<Opt> {
         }
         i += 2;
     }
-    let data_dir = data_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(default_data_dir);
-    let config_path = config
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            if data_dir != default_data_dir() {
-                data_dir.join("config.json")
-            } else {
-                default_config_dir().join("config.json")
-            }
-        });
+    let data_dir = data_dir.map(PathBuf::from).unwrap_or_else(default_data_dir);
+    let config_path = config.map(PathBuf::from).unwrap_or_else(|| {
+        if data_dir != default_data_dir() {
+            data_dir.join("config.json")
+        } else {
+            default_config_dir().join("config.json")
+        }
+    });
     Ok(Opt {
         data_dir,
         config_path,
@@ -130,7 +128,7 @@ fn serve(opt: Opt) -> Result<()> {
     let app = App::new(db, cfg, opt.config_path.clone());
     write_pid(&opt.data_dir)?;
     let threads = monitor::spawn(Arc::clone(&app))?;
-    install_signals();
+    install_signals()?;
     log_info(format!(
         "数据目录 {} ，配置 {}",
         opt.data_dir.display(),
@@ -140,8 +138,9 @@ fn serve(opt: Opt) -> Result<()> {
     let http = std::thread::Builder::new()
         .name("clip-http".into())
         .spawn(move || {
-            if let Err(err) = http_server::serve(app_http) {
+            if let Err(err) = http_server::serve(Arc::clone(&app_http)) {
                 eprintln!("界面退出: {err:#}");
+                app_http.shutdown.store(true, Ordering::Relaxed);
             }
         })?;
     while !shutdown_requested() && !app.shutdown.load(Ordering::Relaxed) {
@@ -164,11 +163,7 @@ fn start_daemon(opt: Opt) -> Result<()> {
     fs::create_dir_all(&opt.data_dir)?;
     restrict_dir(&opt.data_dir);
     let log_path = opt.data_dir.join("monitor.log");
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&log_path)?;
+    let log_file = open_private(&log_path, true)?;
     let exe = std::env::current_exe().context("找不到自身可执行文件")?;
     let mut cmd = Command::new(exe);
     cmd.arg("serve")
@@ -182,6 +177,7 @@ fn start_daemon(opt: Opt) -> Result<()> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(log_file.try_clone()?)
         .stderr(log_file);
+    #[cfg(unix)]
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
@@ -189,6 +185,12 @@ fn start_daemon(opt: Opt) -> Result<()> {
             libc::signal(libc::SIGHUP, libc::SIG_IGN);
             Ok(())
         });
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
     }
     let child = cmd.spawn().context("启动后台进程失败")?;
     let listen_path = opt.data_dir.join("listen");
@@ -205,7 +207,11 @@ fn start_daemon(opt: Opt) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    println!("进程已启动（pid {}），界面地址尚未写出，查看 {}", child.id(), log_path.display());
+    println!(
+        "进程已启动（pid {}），界面地址尚未写出，查看 {}",
+        child.id(),
+        log_path.display()
+    );
     Ok(())
 }
 
@@ -219,7 +225,12 @@ fn stop_daemon(opt: &Opt) -> Result<()> {
         remove_pid(&opt.data_dir);
         return Ok(());
     }
-    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    #[cfg(target_os = "windows")]
+    terminate_process(pid)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         if !pid_exists(pid) {
@@ -248,7 +259,11 @@ fn print_status(opt: &Opt) -> Result<()> {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                 println!(
                     "监控 {} · 库 {} · 写入 {} · 读取 {}",
-                    if v["enabled"].as_bool() == Some(true) { "开" } else { "关" },
+                    if v["enabled"].as_bool() == Some(true) {
+                        "开"
+                    } else {
+                        "关"
+                    },
                     v["db"]["db_human"].as_str().unwrap_or("?"),
                     v["writes_seen"].as_u64().unwrap_or(0),
                     v["reads_seen"].as_u64().unwrap_or(0)
@@ -262,8 +277,16 @@ fn print_status(opt: &Opt) -> Result<()> {
 fn cleanup_cli(opt: &Opt) -> Result<()> {
     let db = Database::open(&opt.data_dir.join("monitor.db"))?;
     let spec = CleanupSpec {
-        from_ms: opt.from.as_deref().map(clipboard_monitor::config::parse_user_time).transpose()?,
-        to_ms: opt.to.as_deref().map(clipboard_monitor::config::parse_user_time).transpose()?,
+        from_ms: opt
+            .from
+            .as_deref()
+            .map(clipboard_monitor::config::parse_user_time)
+            .transpose()?,
+        to_ms: opt
+            .to
+            .as_deref()
+            .map(clipboard_monitor::config::parse_user_time)
+            .transpose()?,
         content_type: opt.content_type.clone(),
         op: opt.op.clone(),
         dry_run: false,
@@ -274,18 +297,22 @@ fn cleanup_cli(opt: &Opt) -> Result<()> {
     Ok(())
 }
 
+fn open_private(path: &Path, append: bool) -> Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    if append {
+        options.append(true);
+    }
+    #[cfg(unix)]
+    options.mode(0o600);
+    Ok(options.open(path)?)
+}
+
 fn lock_or_exit(dir: &Path) -> Result<std::fs::File> {
     let path = dir.join("monitor.lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .open(&path)?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        bail!("已有一个监控进程在使用 {}", dir.display());
-    }
+    let file = open_private(&path, false)?;
+    fs2::FileExt::try_lock_exclusive(&file)
+        .map_err(|_| anyhow!("已有一个监控进程在使用 {}", dir.display()))?;
     restrict_file(&path);
     Ok(file)
 }
@@ -310,39 +337,112 @@ fn process_alive(dir: &Path) -> bool {
     read_pid(dir).is_some_and(is_our_process)
 }
 
+#[cfg(unix)]
 fn pid_exists(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(target_os = "windows")]
+fn pid_exists(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let alive = unsafe { WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT;
+    unsafe { CloseHandle(handle) };
+    alive
 }
 
 fn is_our_process(pid: u32) -> bool {
     if !pid_exists(pid) {
         return false;
     }
-    let Ok(cmd) = fs::read(format!("/proc/{pid}/cmdline")) else {
+    let Some(path) = process_path(pid) else {
         return false;
     };
-    let text = String::from_utf8_lossy(&cmd);
-    text.contains("clipboard-monitor")
-}
-
-fn install_signals() {
-    unsafe {
-        libc::signal(
-            libc::SIGTERM,
-            handle_signal as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGINT,
-            handle_signal as *const () as libc::sighandler_t,
-        );
+    let Ok(current) = std::env::current_exe() else {
+        return false;
+    };
+    let process = fs::canonicalize(&path).unwrap_or(path);
+    let current = fs::canonicalize(&current).unwrap_or(current);
+    #[cfg(target_os = "windows")]
+    {
+        process
+            .to_string_lossy()
+            .eq_ignore_ascii_case(current.to_string_lossy().as_ref())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        process == current
     }
 }
 
-static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-extern "C" fn handle_signal(_: i32) {
-    STOP.store(true, Ordering::Relaxed);
+#[cfg(target_os = "linux")]
+fn process_path(pid: u32) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
+
+#[cfg(target_os = "macos")]
+fn process_path(pid: u32) -> Option<PathBuf> {
+    let mut buffer = vec![0u8; 4096];
+    let len =
+        unsafe { libc::proc_pidpath(pid as i32, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if len <= 0 {
+        return None;
+    }
+    buffer.truncate(len as usize);
+    Some(PathBuf::from(String::from_utf8_lossy(&buffer).into_owned()))
+}
+
+#[cfg(target_os = "windows")]
+fn process_path(pid: u32) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut buffer = vec![0u16; 32768];
+    let mut len = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut len) };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        None
+    } else {
+        buffer.truncate(len as usize);
+        Some(std::ffi::OsString::from_wide(&buffer).into())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_process(pid: u32) -> Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error()).context("打开要停止的进程");
+    }
+    let ok = unsafe { TerminateProcess(handle, 0) };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error()).context("停止 Windows 监控进程");
+    }
+    Ok(())
+}
+
+fn install_signals() -> Result<()> {
+    ctrlc::set_handler(|| STOP.store(true, Ordering::Relaxed)).context("安装退出信号处理")?;
+    Ok(())
+}
+
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn shutdown_requested() -> bool {
     STOP.load(Ordering::Relaxed)
@@ -360,7 +460,11 @@ fn http_get(url: &str) -> Result<String> {
     stream.write_all(req.as_bytes())?;
     let mut buf = String::new();
     stream.read_to_string(&mut buf)?;
-    let body = buf.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("").to_string();
+    let body = buf
+        .split_once("\r\n\r\n")
+        .map(|x| x.1)
+        .unwrap_or("")
+        .to_string();
     Ok(body)
 }
 
@@ -377,8 +481,8 @@ fn print_help() {
 
 不带子命令时等价于 serve，在前台运行并打开本机界面。
 默认界面 http://127.0.0.1:27890
-默认数据目录 ~/.local/share/clipboard-x11
-默认配置 ~/.config/clipboard-x11/config.json
+默认目录遵循 Windows/macOS/Linux 系统规范，详见 README。
+也可用 --data-dir 和 --config 显式指定。
 
 时间可以是 YYYY-MM-DD、YYYY-MM-DDTHH:MM:SS（本地时区）或毫秒时间戳。
 内容类型: text richtext image files custom mixed empty

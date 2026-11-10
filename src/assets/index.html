@@ -289,7 +289,9 @@
   <section id="tab-help" class="hidden">
     <div class="panel">
       <h2>这是什么</h2>
-      <p>它在本机 X11 上记录哪个程序写入了剪贴板、哪个程序又读走了它。日志留在本地 SQLite，不上传。</p>
+      <p>它记录本机剪贴板的文本与图片变化，日志留在本地 SQLite，不上传。Linux/X11 还支持来源进程、PRIMARY 选择区和读取审计。</p>
+      <h2>平台差异</h2>
+      <p>Windows 使用 WM_CLIPBOARDUPDATE 通知；macOS 使用 NSPasteboard.changeCount；Linux 使用 XFixes/RECORD。Windows/macOS 不提供可靠的复制者进程归属和全局读取审计，因此界面不会显示这些能力。</p>
       <h2>记录规则</h2>
       <ul>
         <li>纯文本、富文本：小于 1MB（可改）保存原文，达到上限只留大小和开头一段。</li>
@@ -300,12 +302,12 @@
       <h2>怎么停</h2>
       <p>页面上的开关只暂停记录，进程还在。命令行 <code>clipboard-monitor stop</code> 会退出进程。</p>
       <h2>限制</h2>
-      <p>读取监控依赖 X 服务器的 RECORD 扩展，写入监控依赖 XFixes。Wayland 原生剪贴板不在这个程序的能力范围内。同一次粘贴里连续请求多种格式会合并成一条读取。</p>
+      <p>图片只保存格式、尺寸和大小，不保存像素。Linux 原生 Wayland 客户端不在当前 X11 后端能力范围内；macOS 通过 200ms 间隔检查变化计数，Windows 由系统消息触发。macOS 14+ 的隐私提示可能要求用户允许本程序访问剪贴板。</p>
     </div>
   </section>
 </main>
 <script>
-const state = { page: 0, pageSize: 50, total: 0, selected: null, timer: null, settings: null };
+const state = { page: 0, pageSize: 50, total: 0, selected: null, timer: null, settings: null, capabilities: { reads: true, primary: true } };
 
 const typeName = {
   text: "纯文本", richtext: "富文本", image: "图片", files: "文件",
@@ -381,7 +383,7 @@ function hopButton(hop, currentId) {
   </button>`;
 }
 function renderFlow(flow, currentId) {
-  if (!flow) return "";
+  if (!flow || !state.capabilities.reads) return "";
   const reads = flow.reads || [];
   const names = readerNames(reads);
   let body = "";
@@ -402,15 +404,27 @@ function renderFlow(flow, currentId) {
 
 async function refreshStatus() {
   const s = await api("/api/status");
-  const on = s.enabled && s.xfixes;
-  $("pill").textContent = s.enabled ? (s.xfixes ? "监控中" : "已开启，X11 未就绪") : "已暂停";
-  $("pill").className = "pill " + (s.enabled ? "on" : "off");
+  state.capabilities = s.capabilities || { reads: false, primary: false };
+  const ready = Boolean(s.changes_ready);
+  $("pill").textContent = s.enabled ? (ready ? "监控中" : "已开启，后端未就绪") : "已暂停";
+  $("pill").className = "pill " + (s.enabled && ready ? "on" : "off");
   $("toggle").textContent = s.enabled ? "停止监控" : "开始监控";
   const db = s.db || {};
   $("dbpill").textContent = `${db.db_human || ""} / ${s.max_db_human || ""}`;
   const err = s.last_error ? ` · ${s.last_error}` : "";
+  const backend = { x11: "Linux/X11", windows: "Windows", macos: "macOS" }[s.backend] || s.backend;
+  const reads = state.capabilities.reads ? ` · 读取 ${s.reads_seen}` : "";
   $("meta").textContent =
-    `X11 ${s.display || "?"} · 写入 ${s.writes_seen} · 读取 ${s.reads_seen} · 近 24 小时写 ${db.writes_24h || 0} / 读 ${db.reads_24h || 0} · 保留 ${s.retention_days} 天${on ? "" : ""}${err}`;
+    `${backend} · 写入 ${s.writes_seen}${reads} · 近 24 小时写 ${db.writes_24h || 0} · 保留 ${s.retention_days} 天${err}`;
+  document.querySelectorAll('#f-op option[value="read"], #c-op option[value="read"]').forEach(el => {
+    el.hidden = !state.capabilities.reads;
+    el.disabled = !state.capabilities.reads;
+  });
+  const primaryOption = document.querySelector('#f-sel option[value="PRIMARY"]');
+  primaryOption.hidden = !state.capabilities.primary;
+  primaryOption.disabled = !state.capabilities.primary;
+  $("s-primary").parentElement.classList.toggle("hidden", !state.capabilities.primary);
+  document.querySelector('[data-tab="rules"]').classList.toggle("hidden", s.backend !== "x11");
 }
 
 async function loadApps() {

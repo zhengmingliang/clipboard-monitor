@@ -41,15 +41,20 @@ pub struct FetchInput {
     pub plain: Option<Vec<u8>>,
     pub plain_mime: Option<String>,
     pub plain_total: u64,
+    /// 能取得完整原始文本时提供摘要；流式 X11 抓取可能只有前缀。
+    pub plain_sha256: Option<String>,
     pub rich: Option<Vec<u8>>,
     pub rich_mime: Option<String>,
     pub rich_total: u64,
+    pub rich_sha256: Option<String>,
     pub files_raw: Option<String>,
     pub files_format: Option<String>,
     pub kde_cut: bool,
     pub image_mime: Option<String>,
     pub image_size: u64,
     pub image_header: Vec<u8>,
+    /// 能取得完整编码图片时提供 SHA-256；X11 流式抓取只提供文件头。
+    pub image_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,19 +113,26 @@ pub fn assemble(input: &FetchInput, limits: &Limits) -> Captured {
         (mime.clone(), w, h, input.image_size)
     });
     let plain = input.plain.as_ref().map(|b| {
-        limit_text(b, input.plain_total.max(b.len() as u64), limits)
+        limit_text(
+            b,
+            input.plain_total.max(b.len() as u64),
+            limits,
+            input.plain_sha256.as_deref(),
+        )
     });
     let rich = input.rich.as_ref().map(|b| {
-        limit_text(b, input.rich_total.max(b.len() as u64), limits)
+        limit_text(
+            b,
+            input.rich_total.max(b.len() as u64),
+            limits,
+            input.rich_sha256.as_deref(),
+        )
     });
 
     let has_files = !files.is_empty();
     let has_image = image.is_some();
-    let plain_chars = plain
-        .as_ref()
-        .map(|t| t.text.chars().count())
-        .unwrap_or(0);
-    let has_plain = plain.as_ref().is_some_and(|t| !t.text.trim().is_empty());
+    let plain_chars = plain.as_ref().map(|t| t.text.chars().count()).unwrap_or(0);
+    let has_plain = plain.as_ref().is_some_and(|t| t.total > 0);
     let has_rich = rich.as_ref().is_some_and(|t| !t.text.trim().is_empty());
 
     let content_type = if has_files && has_image {
@@ -135,11 +147,7 @@ pub fn assemble(input: &FetchInput, limits: &Limits) -> Captured {
         TYPE_RICHTEXT
     } else if has_plain {
         TYPE_TEXT
-    } else if input
-        .target_names
-        .iter()
-        .any(|n| !is_noise_target(n))
-    {
+    } else if input.target_names.iter().any(|n| !is_noise_target(n)) {
         TYPE_CUSTOM
     } else {
         TYPE_EMPTY
@@ -182,7 +190,11 @@ pub fn assemble(input: &FetchInput, limits: &Limits) -> Captured {
         });
         size = files.iter().filter_map(|f| f.size).sum();
         if size == 0 {
-            size = input.files_raw.as_ref().map(|s| s.len() as u64).unwrap_or(0);
+            size = input
+                .files_raw
+                .as_ref()
+                .map(|s| s.len() as u64)
+                .unwrap_or(0);
         }
         for f in &files {
             hash_material.extend(f.path.as_bytes());
@@ -191,7 +203,8 @@ pub fn assemble(input: &FetchInput, limits: &Limits) -> Captured {
         if limits.record_file_content && files.len() == 1 {
             if let Some(stored) = maybe_read_file(&files[0], limits) {
                 meta["file_content_stored"] = json!(true);
-                meta["file_content_encoding"] = json!(if stored.is_text { "utf-8" } else { "binary" });
+                meta["file_content_encoding"] =
+                    json!(if stored.is_text { "utf-8" } else { "binary" });
                 if stored.is_text {
                     body = Some(stored.text);
                 } else {
@@ -214,7 +227,12 @@ pub fn assemble(input: &FetchInput, limits: &Limits) -> Captured {
         }
         hash_material.extend(mime.as_bytes());
         hash_material.extend(image_size.to_le_bytes());
-        hash_material.extend(input.image_header.iter().take(64).copied());
+        if let Some(digest) = &input.image_sha256 {
+            hash_material.extend(b"sha256:");
+            hash_material.extend(digest.as_bytes());
+        } else {
+            hash_material.extend(input.image_header.iter().take(64).copied());
+        }
     }
 
     if let Some(text) = &rich {
@@ -252,10 +270,9 @@ pub fn assemble(input: &FetchInput, limits: &Limits) -> Captured {
         }
         if content_type == TYPE_TEXT {
             size = text.total;
-            hash_material.extend(text.hash_bytes.iter().copied());
-        } else if !has_files && !has_image && content_type != TYPE_RICHTEXT {
-            hash_material.extend(text.hash_bytes.iter().copied());
         }
+        // 混合内容的文本替代形式也参与去重，不能只对图片字节做摘要。
+        hash_material.extend(text.hash_bytes.iter().copied());
     }
 
     if content_type == TYPE_CUSTOM {
@@ -276,7 +293,15 @@ pub fn assemble(input: &FetchInput, limits: &Limits) -> Captured {
         hash_material.extend(b"empty");
     }
 
-    let summary = build_summary(content_type, &files, &image, &plain, &rich, &input.target_names, truncated);
+    let summary = build_summary(
+        content_type,
+        &files,
+        &image,
+        &plain,
+        &rich,
+        &input.target_names,
+        truncated,
+    );
     if body.is_none() && content_type == TYPE_TEXT {
         body = plain.map(|t| t.text);
     }
@@ -307,7 +332,12 @@ struct LimitedText {
     hash_bytes: Vec<u8>,
 }
 
-fn limit_text(bytes: &[u8], total_hint: u64, limits: &Limits) -> LimitedText {
+fn limit_text(
+    bytes: &[u8],
+    total_hint: u64,
+    limits: &Limits,
+    full_sha256: Option<&str>,
+) -> LimitedText {
     let total = total_hint.max(bytes.len() as u64);
     let truncated = total >= limits.text_full_limit;
     let keep = if truncated {
@@ -317,8 +347,16 @@ fn limit_text(bytes: &[u8], total_hint: u64, limits: &Limits) -> LimitedText {
     };
     let slice = &bytes[..keep.min(bytes.len())];
     let text = sanitize_text(&String::from_utf8_lossy(slice));
-    let hash_bytes = if truncated {
-        slice.to_vec()
+    let hash_bytes = if let Some(digest) = full_sha256 {
+        let mut material = b"full-text-sha256:".to_vec();
+        material.extend(digest.as_bytes());
+        material
+    } else if truncated {
+        // X11 大内容可能只抓到前缀；至少纳入总长度，并明确这不是全文摘要。
+        let mut material = b"truncated-prefix:".to_vec();
+        material.extend(total.to_le_bytes());
+        material.extend(slice);
+        material
     } else {
         bytes.to_vec()
     };
@@ -365,13 +403,11 @@ fn build_summary(
             (Some(w), Some(h)) => format!("{w}×{h} "),
             _ => String::new(),
         };
-        parts.push(format!(
-            "图片 {mime} {dim}{}",
-            crate::human_bytes(*size)
-        ));
+        parts.push(format!("图片 {mime} {dim}{}", crate::human_bytes(*size)));
     }
     if let Some(text) = plain.as_ref().or(rich.as_ref()) {
-        if matches!(content_type, TYPE_TEXT | TYPE_RICHTEXT | TYPE_MIXED) || files.is_empty() && image.is_none()
+        if matches!(content_type, TYPE_TEXT | TYPE_RICHTEXT | TYPE_MIXED)
+            || files.is_empty() && image.is_none()
         {
             let one = one_line(&text.text, 180);
             if !one.is_empty() {
@@ -542,7 +578,8 @@ pub fn image_dimensions(mime: &str, header: &[u8]) -> Option<(Option<u32>, Optio
     if mime.contains("gif") || header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a") {
         return gif_size(header).map(|(w, h)| (Some(w), Some(h)));
     }
-    if mime.contains("webp") || (header.len() >= 12 && &header[0..4] == b"RIFF" && &header[8..12] == b"WEBP")
+    if mime.contains("webp")
+        || (header.len() >= 12 && &header[0..4] == b"RIFF" && &header[8..12] == b"WEBP")
     {
         return webp_size(header).map(|(w, h)| (Some(w), Some(h)));
     }
@@ -607,13 +644,25 @@ fn jpeg_size(h: &[u8]) -> Option<(u32, u32)> {
         if len < 2 || i + len > h.len() {
             break;
         }
-        if matches!(marker, 0xc0 | 0xc1 | 0xc2 | 0xc3 | 0xc5 | 0xc6 | 0xc7 | 0xc9 | 0xca | 0xcb | 0xcd | 0xce | 0xcf)
+        if matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        ) && len >= 7
         {
-            if len >= 7 {
-                let hgt = u16::from_be_bytes([h[i + 3], h[i + 4]]) as u32;
-                let w = u16::from_be_bytes([h[i + 5], h[i + 6]]) as u32;
-                return Some((w, hgt));
-            }
+            let hgt = u16::from_be_bytes([h[i + 3], h[i + 4]]) as u32;
+            let w = u16::from_be_bytes([h[i + 5], h[i + 6]]) as u32;
+            return Some((w, hgt));
         }
         i += len;
     }
@@ -633,7 +682,8 @@ fn webp_size(h: &[u8]) -> Option<(u32, u32)> {
     if chunk == b"VP8 " && h.len() >= 30 {
         // 12..16 chunk, 16..20 size, 20..23 frame tag, then start code.
         let start = 23;
-        if h.len() >= start + 7 && h[start] == 0x9d && h[start + 1] == 0x01 && h[start + 2] == 0x2a {
+        if h.len() >= start + 7 && h[start] == 0x9d && h[start + 1] == 0x01 && h[start + 2] == 0x2a
+        {
             let w = u16::from_le_bytes([h[start + 3], h[start + 4]]) as u32 & 0x3fff;
             let hgt = u16::from_le_bytes([h[start + 5], h[start + 6]]) as u32 & 0x3fff;
             return Some((w, hgt));
@@ -711,7 +761,7 @@ mod tests {
         assert_eq!(small.body.as_deref(), Some("hello"));
         assert!(!small.truncated);
 
-        let big = vec![b'a'; 40];
+        let big = [b'a'; 40];
         let large = assemble(
             &FetchInput {
                 target_names: vec!["UTF8_STRING".into()],
@@ -729,10 +779,64 @@ mod tests {
     }
 
     #[test]
+    fn large_text_dedup_uses_full_digest_when_available() {
+        let capture = |tail: &str| {
+            let text = format!("abcdefgh{tail}-with-a-long-suffix");
+            let digest = sha256_hex(text.as_bytes());
+            assemble(
+                &FetchInput {
+                    target_names: vec!["text/plain".into()],
+                    plain_total: text.len() as u64,
+                    plain_sha256: Some(digest),
+                    plain: Some(text.into_bytes()),
+                    ..FetchInput::default()
+                },
+                &limits(),
+            )
+        };
+        let first = capture("first");
+        let second = capture("other");
+        assert!(first.truncated && second.truncated);
+        assert_eq!(first.body, second.body);
+        assert_ne!(first.sha256, second.sha256);
+
+        let prefix_only = |total| {
+            assemble(
+                &FetchInput {
+                    target_names: vec!["UTF8_STRING".into()],
+                    plain: Some(b"abcdefgh".to_vec()),
+                    plain_total: total,
+                    ..FetchInput::default()
+                },
+                &limits(),
+            )
+        };
+        assert_ne!(prefix_only(40).sha256, prefix_only(41).sha256);
+    }
+
+    #[test]
+    fn whitespace_only_text_is_still_text() {
+        let captured = assemble(
+            &FetchInput {
+                target_names: vec!["text/plain".into()],
+                plain: Some(b" \t\n".to_vec()),
+                plain_total: 3,
+                ..FetchInput::default()
+            },
+            &limits(),
+        );
+        assert_eq!(captured.content_type, TYPE_TEXT);
+        assert_eq!(captured.body.as_deref(), Some(" \t\n"));
+    }
+
+    #[test]
     fn files_images_and_custom_are_classified() {
         let files = assemble(
             &FetchInput {
-                target_names: vec!["text/uri-list".into(), "x-special/gnome-copied-files".into()],
+                target_names: vec![
+                    "text/uri-list".into(),
+                    "x-special/gnome-copied-files".into(),
+                ],
                 files_raw: Some("copy\nfile:///tmp/a%20b.txt\nfile:///tmp/c.txt\n".into()),
                 files_format: Some("gnome".into()),
                 ..FetchInput::default()
@@ -778,6 +882,27 @@ mod tests {
         );
         assert_eq!(custom.content_type, TYPE_CUSTOM);
         assert!(custom.summary.contains("application/x-my-app"));
+    }
+
+    #[test]
+    fn complete_image_digest_distinguishes_equal_headers() {
+        let input = FetchInput {
+            target_names: vec!["image/png".into()],
+            image_mime: Some("image/png".into()),
+            image_size: 12345,
+            image_header: b"\x89PNG\r\n\x1a\n".to_vec(),
+            image_sha256: Some(sha256_hex(b"first image")),
+            ..FetchInput::default()
+        };
+        let first = assemble(&input, &limits());
+        let second = assemble(
+            &FetchInput {
+                image_sha256: Some(sha256_hex(b"second image")),
+                ..input.clone()
+            },
+            &limits(),
+        );
+        assert_ne!(first.sha256, second.sha256);
     }
 
     #[test]

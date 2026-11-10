@@ -80,7 +80,9 @@ impl Resolver {
         if let Some(hit) = self.windows.get(&window) {
             return hit.clone();
         }
-        let info = self.lookup_window(window).unwrap_or_else(|_| AppInfo::unknown(window));
+        let info = self
+            .lookup_window(window)
+            .unwrap_or_else(|_| AppInfo::unknown(window));
         if self.windows.len() > 1024 {
             self.windows.clear();
         }
@@ -128,11 +130,7 @@ impl Resolver {
             if pid.is_some() && !wm_class.is_empty() {
                 break;
             }
-            let parent = self
-                .conn
-                .query_tree(current)?
-                .reply()?
-                .parent;
+            let parent = self.conn.query_tree(current)?.reply()?.parent;
             if parent == 0 || parent == current {
                 break;
             }
@@ -216,16 +214,17 @@ impl Resolver {
     }
 
     fn wm_class(&self, window: Window) -> String {
-        let reply = match self
-            .conn
-            .get_property(false, window, AtomEnum::WM_CLASS, AtomEnum::ANY, 0, 256)
-        {
-            Ok(cookie) => match cookie.reply() {
-                Ok(reply) => reply,
+        let reply =
+            match self
+                .conn
+                .get_property(false, window, AtomEnum::WM_CLASS, AtomEnum::ANY, 0, 256)
+            {
+                Ok(cookie) => match cookie.reply() {
+                    Ok(reply) => reply,
+                    Err(_) => return String::new(),
+                },
                 Err(_) => return String::new(),
-            },
-            Err(_) => return String::new(),
-        };
+            };
         let parts: Vec<String> = reply
             .value
             .split(|b| *b == 0)
@@ -248,7 +247,12 @@ impl Resolver {
             Err(_) => None,
         };
         reply
-            .map(|r| String::from_utf8_lossy(&r.value).trim_matches('\u{0}').trim().to_string())
+            .map(|r| {
+                String::from_utf8_lossy(&r.value)
+                    .trim_matches('\u{0}')
+                    .trim()
+                    .to_string()
+            })
             .filter(|s| !s.is_empty())
             .unwrap_or_default()
     }

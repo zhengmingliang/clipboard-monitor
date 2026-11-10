@@ -17,7 +17,12 @@ use std::time::Duration;
 const INDEX_HTML: &str = include_str!("assets/index.html");
 
 pub fn serve(app: Arc<App>) -> Result<()> {
-    let listen = app.config.read().unwrap_or_else(|e| e.into_inner()).listen.clone();
+    let listen = app
+        .config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .listen
+        .clone();
     let listener = TcpListener::bind(&listen).with_context(|| format!("监听 {listen} 失败"))?;
     listener.set_nonblocking(false)?;
     let addr = listener.local_addr()?;
@@ -53,7 +58,10 @@ pub fn serve(app: Arc<App>) -> Result<()> {
 }
 
 fn data_dir_from_db(app: &App) -> Option<std::path::PathBuf> {
-    app.db.lock().ok().and_then(|db| db.path().parent().map(|p| p.to_path_buf()))
+    app.db
+        .lock()
+        .ok()
+        .and_then(|db| db.path().parent().map(|p| p.to_path_buf()))
 }
 
 fn is_loopback(addr: &str) -> bool {
@@ -104,13 +112,18 @@ fn handle_client(app: Arc<App>, mut stream: TcpStream) -> Result<()> {
         }
         buf.extend_from_slice(&tmp[..n]);
     }
-    let body = &buf[header_end..header_end + content_length.min(buf.len().saturating_sub(header_end))];
+    let body =
+        &buf[header_end..header_end + content_length.min(buf.len().saturating_sub(header_end))];
     let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
     let response = dispatch(&app, &method, path, query, body);
     match response {
         Ok(resp) => write_response(&mut stream, resp),
         Err(err) => {
-            let status = if err.to_string().contains("不存在") { 404 } else { 400 };
+            let status = if err.to_string().contains("不存在") {
+                404
+            } else {
+                400
+            };
             write_response(
                 &mut stream,
                 Response {
@@ -169,8 +182,16 @@ fn dispatch(app: &App, method: &str, path: &str, query: &str, body: &[u8]) -> Re
             to_ms: q.get("to").and_then(|s| s.parse().ok()),
             query: q.get("q").cloned(),
         };
-        let limit = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50).clamp(1, 200);
-        let offset = q.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0).max(0);
+        let limit = q
+            .get("limit")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50)
+            .clamp(1, 200);
+        let offset = q
+            .get("offset")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+            .max(0);
         let db = app.db.lock().unwrap_or_else(|e| e.into_inner());
         let (rows, total) = db.query_events(&filter, limit, offset)?;
         return Ok(json_ok(json!({"total": total, "events": rows})));
@@ -221,7 +242,12 @@ fn dispatch(app: &App, method: &str, path: &str, query: &str, body: &[u8]) -> Re
     if method == "PUT" && path == "/api/settings" {
         let mut cfg: Config = serde_json::from_slice(body).context("设置 JSON 无法解析")?;
         // 监听地址改了要重启进程才生效，先记住旧地址并写回去，避免这次保存把端口改丢。
-        let current_listen = app.config.read().unwrap_or_else(|e| e.into_inner()).listen.clone();
+        let current_listen = app
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .listen
+            .clone();
         let listen_changed = cfg.listen != current_listen;
         if listen_changed {
             cfg.listen = current_listen;
@@ -282,8 +308,15 @@ fn status_json(app: &App) -> Result<Value> {
         "uptime_sec": app.started.elapsed().as_secs(),
         "pid": app.self_pid,
         "listen": listen,
-        "display": std::env::var("DISPLAY").unwrap_or_default(),
-        "backend": "x11",
+        "display": if cfg!(target_os = "linux") { std::env::var("DISPLAY").unwrap_or_default() } else { String::new() },
+        "backend": crate::monitor::BACKEND,
+        "changes_ready": app.changes_ok.load(Ordering::Relaxed),
+        "capabilities": {
+            "text": true,
+            "image": true,
+            "reads": crate::monitor::SUPPORTS_READS,
+            "primary": crate::monitor::SUPPORTS_PRIMARY,
+        },
         "xfixes": app.xfixes_ok.load(Ordering::Relaxed),
         "record": app.record_ok.load(Ordering::Relaxed),
         "writes_seen": app.counters.writes.load(Ordering::Relaxed),

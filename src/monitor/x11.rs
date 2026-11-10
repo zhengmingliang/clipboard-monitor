@@ -4,22 +4,25 @@
 //! 两条事件先进入约 40ms 的重排缓冲，按 X 服务器时间排序后再落库，避免读事件
 //! 比对应的写事件更早入库。抓取内容在另一条连接上完成，不挡住事件读取。
 
+use super::{limits_from, App, Snap};
 use crate::classify::{empty_capture, unavailable_capture, Captured, Limits};
-use crate::config::{is_whitelisted, Config};
-use crate::db::{Database, NewEvent};
+use crate::config::is_whitelisted;
+use crate::db::NewEvent;
 use crate::fetch::{self, Atoms};
 use crate::log_debug;
 use crate::log_info;
 use crate::log_warn;
 use crate::now_ms;
 use crate::resolver::{AppInfo, Resolver};
-use crate::x11util::{self, client_range, connect_x, create_helper_window, raw_fd, wait_readable, ClientRange, XConn};
-use crate::xparse::{parse_convert_selections, xid_belongs};
+use crate::x11util::{
+    self, client_range, connect_x, create_helper_window, raw_fd, wait_readable, XConn,
+};
+use crate::xparse::parse_convert_selections;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use x11rb::connection::{Connection, RequestConnection};
@@ -30,46 +33,6 @@ use x11rb::protocol::Event;
 
 const REORDER: Duration = Duration::from_millis(40);
 const READ_BURST: i64 = 300;
-
-#[derive(Default)]
-pub struct Counters {
-    pub writes: AtomicU64,
-    pub reads: AtomicU64,
-    pub ignored_self: AtomicU64,
-    pub last_event_ms: AtomicI64,
-}
-
-pub struct App {
-    pub db: Mutex<Database>,
-    pub config: RwLock<Config>,
-    pub config_path: std::path::PathBuf,
-    pub enabled: AtomicBool,
-    pub shutdown: AtomicBool,
-    pub started: Instant,
-    pub counters: Counters,
-    pub listen: RwLock<String>,
-    pub self_pid: u32,
-    pub self_exe: String,
-    pub last_error: Mutex<String>,
-    pub record_ok: AtomicBool,
-    pub xfixes_ok: AtomicBool,
-    snaps: Mutex<HashMap<String, Snap>>,
-    clients: RwLock<Vec<ClientRange>>,
-}
-
-#[derive(Clone)]
-struct Snap {
-    content_id: i64,
-    event_id: Option<i64>,
-    source_app: String,
-    source_pid: Option<i32>,
-    owner: u32,
-    summary: String,
-    content_type: String,
-    size: u64,
-    truncated: bool,
-    targets: String,
-}
 
 struct RawWrite {
     seq: u64,
@@ -104,7 +67,6 @@ enum Msg {
     Write(RawWrite),
     Read(RawRead),
     FetchDone(FetchDone),
-    Shutdown,
 }
 
 struct FetchJob {
@@ -134,139 +96,17 @@ struct Burst {
     targets: Vec<String>,
 }
 
-impl App {
-    pub fn new(db: Database, config: Config, config_path: std::path::PathBuf) -> Arc<Self> {
-        let enabled = config.enabled_on_start;
-        let self_exe = std::env::current_exe()
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        Arc::new(Self {
-            db: Mutex::new(db),
-            config: RwLock::new(config),
-            config_path,
-            enabled: AtomicBool::new(enabled),
-            shutdown: AtomicBool::new(false),
-            started: Instant::now(),
-            counters: Counters::default(),
-            listen: RwLock::new(String::new()),
-            self_pid: std::process::id(),
-            self_exe,
-            last_error: Mutex::new(String::new()),
-            record_ok: AtomicBool::new(false),
-            xfixes_ok: AtomicBool::new(false),
-            snaps: Mutex::new(HashMap::new()),
-            clients: RwLock::new(Vec::new()),
-        })
-    }
-
-    pub fn set_enabled(&self, enabled: bool) -> Result<()> {
-        self.enabled.store(enabled, Ordering::Relaxed);
-        let mut cfg = self.config.write().unwrap_or_else(|e| e.into_inner());
-        cfg.enabled_on_start = enabled;
-        cfg.save(&self.config_path)?;
-        Ok(())
-    }
-
-    pub fn replace_config(&self, mut cfg: Config) -> Result<()> {
-        cfg.validate()?;
-        // 启停只走监控开关。保存其它设置时保留当前开关，避免界面把监控重新打开。
-        cfg.enabled_on_start = self.enabled.load(Ordering::Relaxed);
-        cfg.save(&self.config_path)?;
-        *self.config.write().unwrap_or_else(|e| e.into_inner()) = cfg;
-        Ok(())
-    }
-
-    pub fn keep_content_ids(&self) -> Vec<i64> {
-        self.snaps
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .map(|s| s.content_id)
-            .collect()
-    }
-
-    fn register_client(&self, range: ClientRange) {
-        let mut guard = self.clients.write().unwrap_or_else(|e| e.into_inner());
-        if !guard.iter().any(|c| c.base == range.base && c.mask == range.mask) {
-            log_debug(format!("登记自身 X 客户端 base={:#x} mask={:#x}", range.base, range.mask));
-            guard.push(range);
-        }
-    }
-
-    fn is_self_client(&self, xid_base: u32, requestor: u32) -> bool {
-        let guard = self.clients.read().unwrap_or_else(|e| e.into_inner());
-        guard.iter().any(|c| c.base == xid_base || xid_belongs(requestor, c.base, c.mask))
-    }
-
-    fn note_error(&self, err: &str) {
-        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = err.to_string();
-    }
-}
-
-pub struct Threads {
-    joins: Vec<JoinHandle<()>>,
-    tx: Sender<Msg>,
-}
-
-pub fn spawn(app: Arc<App>) -> Result<Threads> {
+pub(super) fn spawn(app: Arc<App>) -> Result<Vec<JoinHandle<()>>> {
     let (tx, rx) = mpsc::channel::<Msg>();
     let pipeline_app = Arc::clone(&app);
     let pipeline_tx = tx.clone();
     let pipeline = thread::Builder::new()
         .name("clip-pipeline".into())
         .spawn(move || pipeline_main(pipeline_app, rx, pipeline_tx))?;
-    let x_app = Arc::clone(&app);
-    let x_tx = tx.clone();
     let xthread = thread::Builder::new()
         .name("clip-x11".into())
-        .spawn(move || x_supervisor(x_app, x_tx))?;
-    let clean_app = Arc::clone(&app);
-    let cleaner = thread::Builder::new()
-        .name("clip-cleanup".into())
-        .spawn(move || cleanup_loop(clean_app))?;
-    Ok(Threads {
-        joins: vec![pipeline, xthread, cleaner],
-        tx,
-    })
-}
-
-pub fn shutdown(app: &App, threads: Threads) {
-    app.shutdown.store(true, Ordering::Relaxed);
-    let _ = threads.tx.send(Msg::Shutdown);
-    for join in threads.joins {
-        let _ = join.join();
-    }
-    if let Ok(db) = app.db.lock() {
-        db.checkpoint();
-    }
-}
-
-fn cleanup_loop(app: Arc<App>) {
-    while !app.shutdown.load(Ordering::Relaxed) {
-        for _ in 0..30 {
-            if app.shutdown.load(Ordering::Relaxed) {
-                return;
-            }
-            thread::sleep(Duration::from_secs(1));
-        }
-        let (days, max_bytes) = {
-            let cfg = app.config.read().unwrap_or_else(|e| e.into_inner());
-            (cfg.retention_days, cfg.max_db_bytes())
-        };
-        let keep = app.keep_content_ids();
-        match app.db.lock() {
-            Ok(db) => match db.enforce_limits(days, max_bytes, &keep) {
-                Ok((expired, trimmed)) => {
-                    if expired > 0 || trimmed > 0 {
-                        log_info(format!("自动清理：过期 {expired} 条，容量淘汰 {trimmed} 条"));
-                    }
-                }
-                Err(err) => log_warn(format!("自动清理失败: {err:#}")),
-            },
-            Err(_) => log_warn("数据库锁中断，跳过本轮清理"),
-        }
-    }
+        .spawn(move || x_supervisor(app, tx))?;
+    Ok(vec![pipeline, xthread])
 }
 
 fn x_supervisor(app: Arc<App>, tx: Sender<Msg>) {
@@ -279,6 +119,7 @@ fn x_supervisor(app: Arc<App>, tx: Sender<Msg>) {
                 app.note_error(&msg);
                 app.record_ok.store(false, Ordering::Relaxed);
                 app.xfixes_ok.store(false, Ordering::Relaxed);
+                app.changes_ok.store(false, Ordering::Relaxed);
                 thread::sleep(Duration::from_secs(1));
             }
         }
@@ -347,6 +188,8 @@ fn write_loop(app: &App, tx: &Sender<Msg>, ctx_tx: Sender<Result<u32>>) -> Resul
         .check()?;
     conn.flush()?;
     app.xfixes_ok.store(true, Ordering::Relaxed);
+    app.changes_ok.store(true, Ordering::Relaxed);
+    app.clear_error();
     log_info("写入监控已挂上 XFixes");
 
     let mut was_enabled = false;
@@ -383,7 +226,10 @@ struct RecordGuard<'a> {
 
 impl Drop for RecordGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.conn.record_disable_context(self.id).map(|c| c.ignore_error());
+        let _ = self
+            .conn
+            .record_disable_context(self.id)
+            .map(|c| c.ignore_error());
         let _ = self.conn.flush();
     }
 }
@@ -421,7 +267,13 @@ fn setup_record(conn: &XConn) -> Result<u32> {
     Ok(rc)
 }
 
-fn send_snapshot(app: &App, conn: &XConn, atoms: &Atoms, tx: &Sender<Msg>, seq: &mut u64) -> Result<()> {
+fn send_snapshot(
+    app: &App,
+    conn: &XConn,
+    atoms: &Atoms,
+    tx: &Sender<Msg>,
+    seq: &mut u64,
+) -> Result<()> {
     let cfg = app.config.read().unwrap_or_else(|e| e.into_inner()).clone();
     for (name, atom) in selection_pairs(atoms, cfg.monitor_primary) {
         let owner = conn.get_selection_owner(atom)?.reply()?.owner;
@@ -440,6 +292,7 @@ fn send_snapshot(app: &App, conn: &XConn, atoms: &Atoms, tx: &Sender<Msg>, seq: 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_xfixes(
     app: &App,
     atoms: &Atoms,
@@ -456,7 +309,13 @@ fn handle_xfixes(
     let Some(name) = atoms.selection_name(selection) else {
         return;
     };
-    if name == "PRIMARY" && !app.config.read().unwrap_or_else(|e| e.into_inner()).monitor_primary {
+    if name == "PRIMARY"
+        && !app
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .monitor_primary
+    {
         return;
     }
     let reason = if owner == 0 {
@@ -469,7 +328,9 @@ fn handle_xfixes(
         "owner_change"
     };
     *seq += 1;
-    app.counters.last_event_ms.store(now_ms(), Ordering::Relaxed);
+    app.counters
+        .last_event_ms
+        .store(now_ms(), Ordering::Relaxed);
     if tx
         .send(Msg::Write(RawWrite {
             seq: *seq,
@@ -521,7 +382,11 @@ fn read_loop(app: &App, tx: &Sender<Msg>, context: u32) -> Result<()> {
                 continue;
             };
             if name == "PRIMARY"
-                && !app.config.read().unwrap_or_else(|e| e.into_inner()).monitor_primary
+                && !app
+                    .config
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .monitor_primary
             {
                 continue;
             }
@@ -592,7 +457,6 @@ fn pipeline_main(app: Arc<App>, rx: Receiver<Msg>, self_tx: Sender<Msg>) {
             break;
         }
         match rx.recv_timeout(Duration::from_millis(20)) {
-            Ok(Msg::Shutdown) => break,
             Ok(Msg::Write(ev)) => buf.push(Incoming::Write(ev)),
             Ok(Msg::Read(ev)) => buf.push(Incoming::Read(ev)),
             Ok(Msg::FetchDone(done)) => apply_fetch(&app, done),
@@ -631,7 +495,7 @@ fn flush_ready(
         }
     }
     *buf = keep;
-    ready.sort_by(|a, b| cmp_x_time(a, b));
+    ready.sort_by(cmp_x_time);
     for ev in ready {
         match ev {
             Incoming::Write(w) => handle_write(app, resolver, bursts, job_tx, w)?,
@@ -813,7 +677,9 @@ fn handle_read(
                 burst.event_id,
                 &burst.targets.join(", "),
                 &summary,
-                snap.as_ref().map(|s| s.content_type.as_str()).unwrap_or("custom"),
+                snap.as_ref()
+                    .map(|s| s.content_type.as_str())
+                    .unwrap_or("custom"),
                 snap.as_ref().map(|s| s.size).unwrap_or(0),
                 snap.as_ref().map(|s| s.content_id),
                 snap.as_ref().map(|s| s.source_app.as_str()).unwrap_or(""),
@@ -869,8 +735,14 @@ fn handle_read(
 }
 
 fn read_summary(snap: Option<&Snap>, targets: &[String]) -> String {
-    let source = snap.map(|s| s.source_app.as_str()).filter(|s| !s.is_empty()).unwrap_or("未知来源");
-    let body = snap.map(|s| s.summary.as_str()).filter(|s| !s.is_empty()).unwrap_or("内容获取中");
+    let source = snap
+        .map(|s| s.source_app.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("未知来源");
+    let body = snap
+        .map(|s| s.summary.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("内容获取中");
     let mut text = format!("来自 {source}：{body}");
     if !targets.is_empty() {
         text.push_str(" · 目标 ");
@@ -902,15 +774,6 @@ fn apply_fetch(app: &App, done: FetchDone) {
             snap.truncated = done.captured.truncated;
             snap.targets = done.captured.targets.join(", ");
         }
-    }
-}
-
-fn limits_from(cfg: &Config) -> Limits {
-    Limits {
-        text_full_limit: cfg.text_full_limit_bytes,
-        text_preview: cfg.text_preview_bytes,
-        file_content_limit: cfg.file_content_limit_bytes,
-        record_file_content: cfg.record_file_content,
     }
 }
 
@@ -1011,4 +874,3 @@ fn connect_fetch() -> Result<FetchState> {
 fn intern_pid(conn: &XConn) -> Result<u32> {
     x11util::intern(conn, "_NET_WM_PID")
 }
-

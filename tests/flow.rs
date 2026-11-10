@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 //! 在当前 X11 上验证剪贴板写入、读取、流转和清理。
 //!
 //! 默认不跑，避免改掉正在使用的剪贴板。需要时：
@@ -10,7 +12,7 @@ use clipboard_monitor::x11util::{connect_x, create_helper_window, intern, raw_fd
 use serde_json::Value;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -51,7 +53,8 @@ fn restore_holder() {
 
 fn live() -> Result<(), Box<dyn std::error::Error>> {
     let saved = read_utf8_clipboard().unwrap_or(None);
-    let dir = std::env::temp_dir().join(format!("clipmon-live-{}-{}", std::process::id(), now_ms()));
+    let dir =
+        std::env::temp_dir().join(format!("clipmon-live-{}-{}", std::process::id(), now_ms()));
     fs::create_dir_all(&dir)?;
     let log_path = dir.join("test.log");
     let log = std::fs::OpenOptions::new()
@@ -91,7 +94,10 @@ fn live() -> Result<(), Box<dyn std::error::Error>> {
             .cloned()
             .collect();
         writes.sort_by_key(|e| e["ts_ms"].as_i64().unwrap_or(0));
-        let write = writes.first().cloned().ok_or("没有记录到包含测试文本的写入")?;
+        let write = writes
+            .first()
+            .cloned()
+            .ok_or("没有记录到包含测试文本的写入")?;
         let read = events
             .iter()
             .filter(|e| e["op"] == "read" && e["ts_ms"].as_i64().unwrap_or(0) + 30 >= t_read)
@@ -119,7 +125,7 @@ fn live() -> Result<(), Box<dyn std::error::Error>> {
                 && events.iter().any(|w| {
                     w["op"] == "write"
                         && (r["source_event_id"] == w["id"]
-                            || (r["source_app"].as_str().unwrap_or("").len() > 0
+                            || (!r["source_app"].as_str().unwrap_or("").is_empty()
                                 && r["source_app"] == w["app_name"]))
                 })
         });
@@ -158,7 +164,9 @@ fn live() -> Result<(), Box<dyn std::error::Error>> {
         let skipped = query_events(&base, &token2)?;
         let leaked = skipped.iter().any(|e| {
             e["pid"].as_i64() == Some(self_pid)
-                || names.iter().any(|n| e["app_name"].as_str() == Some(n.as_str()))
+                || names
+                    .iter()
+                    .any(|n| e["app_name"].as_str() == Some(n.as_str()))
         });
         assert!(!leaked, "白名单没有挡住本进程: {skipped:?}");
         drop(offer2);
@@ -178,7 +186,10 @@ fn live() -> Result<(), Box<dyn std::error::Error>> {
                 "dry_run": false
             }),
         )?;
-        assert!(removed["matched"].as_u64().unwrap_or(0) >= 1, "清理没有删到记录: {removed}");
+        assert!(
+            removed["matched"].as_u64().unwrap_or(0) >= 1,
+            "清理没有删到记录: {removed}"
+        );
         let left = query_events(&base, &token)?;
         assert!(left.is_empty(), "清理后仍能查到测试文本: {left:?}");
         Ok(())
@@ -188,7 +199,14 @@ fn live() -> Result<(), Box<dyn std::error::Error>> {
     let _ = child.wait();
     if result.is_err() {
         if let Ok(text) = fs::read_to_string(&log_path) {
-            let tail: String = text.chars().rev().take(2500).collect::<String>().chars().rev().collect();
+            let tail: String = text
+                .chars()
+                .rev()
+                .take(2500)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
             eprintln!("---- monitor log tail ----\n{tail}");
         }
     }
@@ -250,7 +268,11 @@ fn offer_clipboard(bytes: &[u8]) -> Result<(i64, Offer), Box<dyn std::error::Err
     ))
 }
 
-fn serve_until(bytes: &[u8], stop: &AtomicBool, ready: &mpsc::Sender<Result<i64, String>>) -> Result<(), String> {
+fn serve_until(
+    bytes: &[u8],
+    stop: &AtomicBool,
+    ready: &mpsc::Sender<Result<i64, String>>,
+) -> Result<(), String> {
     let (conn, screen) = connect_x().map_err(|e| e.to_string())?;
     let window = create_helper_window(&conn, screen).map_err(|e| e.to_string())?;
     let clipboard = intern(&conn, "CLIPBOARD").map_err(|e| e.to_string())?;
@@ -286,7 +308,11 @@ fn answer(
     targets: Atom,
     string_atom: Atom,
 ) -> Result<(), String> {
-    let mut property = if req.property == 0 { req.target } else { req.property };
+    let mut property = if req.property == 0 {
+        req.target
+    } else {
+        req.property
+    };
     let delivered = if req.target == targets {
         let atoms = [targets, utf8, string_atom];
         let mut data = Vec::with_capacity(atoms.len() * 4);
@@ -401,7 +427,9 @@ fn read_utf8_clipboard() -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> 
                 }
             }
         } else {
-            let left = deadline.saturating_duration_since(Instant::now()).as_millis() as i32;
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as i32;
             if !wait_readable(fd, left.max(1)) {
                 break;
             }
@@ -422,7 +450,7 @@ fn read_utf8_clipboard() -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> 
     Ok(Some(reply.value))
 }
 
-fn wait_listen(dir: &PathBuf, child: &mut Child) -> Result<String, Box<dyn std::error::Error>> {
+fn wait_listen(dir: &Path, child: &mut Child) -> Result<String, Box<dyn std::error::Error>> {
     let path = dir.join("listen");
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
@@ -440,7 +468,11 @@ fn wait_listen(dir: &PathBuf, child: &mut Child) -> Result<String, Box<dyn std::
     Err("界面没有在 8 秒内开始监听".into())
 }
 
-fn wait_backend(base: &str, child: &mut Child, log_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn wait_backend(
+    base: &str,
+    child: &mut Child,
+    log_path: &PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(6);
     let mut last = String::new();
     while Instant::now() < deadline {
@@ -459,7 +491,11 @@ fn wait_backend(base: &str, child: &mut Child, log_path: &PathBuf) -> Result<(),
     Err(format!("X11 监控没有就绪: {last}").into())
 }
 
-fn wait_token(base: &str, token: &str, limit: Duration) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+fn wait_token(
+    base: &str,
+    token: &str,
+    limit: Duration,
+) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + limit;
     let mut last = Vec::new();
     while Instant::now() < deadline {
@@ -477,10 +513,7 @@ fn wait_token(base: &str, token: &str, limit: Duration) -> Result<Vec<Value>, Bo
 }
 
 fn query_events(base: &str, token: &str) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
-    let url = format!(
-        "{base}/api/events?q={}&limit=50",
-        url_encode(token)
-    );
+    let url = format!("{base}/api/events?q={}&limit=50", url_encode(token));
     let v = get_json(&url)?;
     Ok(v["events"].as_array().cloned().unwrap_or_default())
 }
@@ -508,7 +541,11 @@ fn post_json(url: &str, value: &Value) -> Result<Value, Box<dyn std::error::Erro
     Ok(serde_json::from_str(&body)?)
 }
 
-fn http(method: &str, url: &str, body: Option<String>) -> Result<String, Box<dyn std::error::Error>> {
+fn http(
+    method: &str,
+    url: &str,
+    body: Option<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let rest = url.trim_start_matches("http://");
     let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
     let mut stream = std::net::TcpStream::connect(host)?;

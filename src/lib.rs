@@ -1,16 +1,21 @@
 //! 本机剪贴板监控。
 //!
-//! X11 上用 XFixes 记录写入，用 RECORD 扩展记录 `ConvertSelection` 读取。
+//! Linux/X11 上用 XFixes 记录写入，用 RECORD 扩展记录 `ConvertSelection` 读取。
+//! Windows/macOS 记录系统剪贴板的文本与图片变化。
 //! 内容按类型截断后写入 SQLite，界面由本机 HTTP 服务提供。
 
 pub mod classify;
 pub mod config;
 pub mod db;
+#[cfg(target_os = "linux")]
 pub mod fetch;
 pub mod http_server;
 pub mod monitor;
+#[cfg(target_os = "linux")]
 pub mod resolver;
+#[cfg(target_os = "linux")]
 pub mod x11util;
+#[cfg(target_os = "linux")]
 pub mod xparse;
 
 use std::io::Write;

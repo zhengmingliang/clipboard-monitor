@@ -1,0 +1,182 @@
+name: build-and-release
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            executable: clipboard-monitor.exe
+            rustflags: -C target-feature=+crt-static
+          - name: macos-aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            executable: clipboard-monitor
+            rustflags: ""
+          - name: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            executable: clipboard-monitor
+            rustflags: ""
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            executable: clipboard-monitor
+            rustflags: ""
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            executable: clipboard-monitor
+            rustflags: ""
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Xvfb for Linux clipboard tests
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.target }}
+          workspaces: ". -> target"
+
+      - name: Run tests on native OS
+        run: cargo test --locked --target ${{ matrix.target }} --all-targets
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Verify native text and image clipboard monitoring
+        env:
+          CLIPBOARD_MONITOR_NATIVE_LIVE: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a -s "-screen 0 1280x1024x24 +extension XFIXES +extension RECORD" \
+              cargo test --locked --release --target '${{ matrix.target }}' --test native_clipboard -- --ignored --nocapture --test-threads=1
+          else
+            cargo test --locked --release --target '${{ matrix.target }}' --test native_clipboard -- --ignored --nocapture --test-threads=1
+          fi
+
+      - name: Check executable starts
+        shell: bash
+        run: '"target/${{ matrix.target }}/release/${{ matrix.executable }}" --help'
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          version="$(printf '%s' "$version" | tr '/\\<>:"|?*' '---------')"
+          asset="clipboard-monitor-${version}-${{ matrix.name }}.tar.gz"
+          mkdir -p dist package
+          cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" package/
+          cp README.md package/
+          tar -C package -czf "dist/$asset" .
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME
+          if ($env:GITHUB_REF_TYPE -ne "tag") {
+            $version = "dev-$($env:GITHUB_SHA.Substring(0, 7))"
+          }
+          $version = $version -replace '[\\/<>:"|?*]', '-'
+          $asset = "clipboard-monitor-$version-${{ matrix.name }}.zip"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.executable }}", "README.md" -DestinationPath "dist/$asset" -Force
+
+      - name: Run executable from extracted Unix package
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p verify-package
+          tar -xzf dist/*.tar.gz -C verify-package
+          test -f verify-package/README.md
+          ./verify-package/clipboard-monitor --help
+
+      - name: Run executable from extracted Windows package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem dist/*.zip | Select-Object -First 1
+          Expand-Archive -Path $archive.FullName -DestinationPath verify-package -Force
+          if (-not (Test-Path verify-package/README.md)) { throw "README.md missing from package" }
+          & ./verify-package/clipboard-monitor.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "Packaged executable failed with exit code $LASTEXITCODE" }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipboard-monitor-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum clipboard-monitor-* > SHA256SUMS
+
+      - name: Create versioned release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

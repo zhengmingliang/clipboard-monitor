@@ -20,7 +20,9 @@ pub struct ClientRange {
 pub fn connect_x() -> Result<(XConn, usize)> {
     let display = std::env::var("DISPLAY").unwrap_or_default();
     if display.is_empty() {
-        bail!("未设置 DISPLAY。这个工具监控 X11 剪贴板，Wayland 会话请在 XWayland 或 X11 会话中运行");
+        bail!(
+            "未设置 DISPLAY。这个工具监控 X11 剪贴板，Wayland 会话请在 XWayland 或 X11 会话中运行"
+        );
     }
     x11rb::connect(None).with_context(|| format!("连接 X11 {display} 失败"))
 }
@@ -56,7 +58,12 @@ pub fn intern(conn: &XConn, name: &str) -> Result<Atom> {
 }
 
 pub fn create_helper_window(conn: &XConn, screen: usize) -> Result<Window> {
-    let root = conn.setup().roots.get(screen).context("无效的 screen")?.root;
+    let root = conn
+        .setup()
+        .roots
+        .get(screen)
+        .context("无效的 screen")?
+        .root;
     let window = conn.generate_id()?;
     conn.create_window(
         x11rb::COPY_DEPTH_FROM_PARENT,

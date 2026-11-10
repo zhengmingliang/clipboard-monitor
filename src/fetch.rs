@@ -113,7 +113,7 @@ pub fn capture_selection(
         ..FetchInput::default()
     };
 
-    if targets.iter().any(|a| *a == atoms.kde_cut) {
+    if targets.contains(&atoms.kde_cut) {
         input.kde_cut = true;
     }
 
@@ -136,16 +136,23 @@ pub fn capture_selection(
         }
     }
 
-    if let Some(atom) = pick(&targets, &[atoms.png, atoms.webp, atoms.gif, atoms.jpeg, atoms.bmp]) {
+    if let Some(atom) = pick(
+        &targets,
+        &[atoms.png, atoms.webp, atoms.gif, atoms.jpeg, atoms.bmp],
+    ) {
         let mime = atom_name(conn, names, atom);
-        if let Some(data) = read_target(conn, window, atoms, selection, atom, 64 * 1024, 64 * 1024)? {
+        if let Some(data) = read_target(conn, window, atoms, selection, atom, 64 * 1024, 64 * 1024)?
+        {
             input.image_size = data.total;
             input.image_header = data.bytes;
             input.image_mime = Some(mime);
         }
     }
 
-    if let Some(atom) = pick(&targets, &[atoms.html, atoms.rtf, atoms.app_rtf, atoms.rich]) {
+    if let Some(atom) = pick(
+        &targets,
+        &[atoms.html, atoms.rtf, atoms.app_rtf, atoms.rich],
+    ) {
         if let Some(data) = read_target(
             conn,
             window,
@@ -163,7 +170,13 @@ pub fn capture_selection(
 
     if let Some(atom) = pick(
         &targets,
-        &[atoms.utf8, atoms.plain_utf8, atoms.plain, atoms.string, atoms.text],
+        &[
+            atoms.utf8,
+            atoms.plain_utf8,
+            atoms.plain,
+            atoms.string,
+            atoms.text,
+        ],
     ) {
         if let Some(data) = read_target(
             conn,
@@ -242,7 +255,15 @@ fn read_target_list(
     atoms: &Atoms,
     selection: Atom,
 ) -> Result<Vec<Atom>> {
-    let Some(data) = read_target(conn, window, atoms, selection, atoms.targets, 64 * 1024, 64 * 1024)?
+    let Some(data) = read_target(
+        conn,
+        window,
+        atoms,
+        selection,
+        atoms.targets,
+        64 * 1024,
+        64 * 1024,
+    )?
     else {
         return Ok(Vec::new());
     };
@@ -274,7 +295,9 @@ fn read_target(
         Ok(property) => property,
         Err(err) if err.to_string().contains("超时") => {
             log_debug(format!("目标 {target} 等待超时"));
-            let _ = conn.delete_property(window, atoms.prop).map(|c| c.ignore_error());
+            let _ = conn
+                .delete_property(window, atoms.prop)
+                .map(|c| c.ignore_error());
             let _ = conn.flush();
             return Ok(None);
         }
@@ -283,8 +306,12 @@ fn read_target(
     if property == 0 {
         return Ok(None);
     }
-    let data = read_property(conn, fd, window, property, atoms.incr, full_limit, preview, deadline)?;
-    let _ = conn.delete_property(window, property).map(|c| c.ignore_error());
+    let data = read_property(
+        conn, fd, window, property, atoms.incr, full_limit, preview, deadline,
+    )?;
+    let _ = conn
+        .delete_property(window, property)
+        .map(|c| c.ignore_error());
     let _ = conn.flush();
     Ok(Some(data))
 }
@@ -314,6 +341,7 @@ fn wait_selection(
     bail!("等待 SelectionNotify 超时 target={target}");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_property(
     conn: &XConn,
     fd: i32,
@@ -325,7 +353,14 @@ fn read_property(
     deadline: Instant,
 ) -> Result<BytesOut> {
     let first = conn
-        .get_property(false, window, property, AtomEnum::ANY, 0, ((full_limit.max(4) + 3) / 4) as u32)?
+        .get_property(
+            false,
+            window,
+            property,
+            AtomEnum::ANY,
+            0,
+            (full_limit.max(4).div_ceil(4)) as u32,
+        )?
         .reply()
         .context("GetProperty")?;
     if first.type_ == incr_atom || first.type_ == intern_incr_fallback(first.type_, incr_atom) {
@@ -407,7 +442,11 @@ fn read_incr(
             break;
         }
         total += chunk.value.len() as u64;
-        let limit_now = if total >= full_limit as u64 { preview } else { full_limit };
+        let limit_now = if total >= full_limit as u64 {
+            preview
+        } else {
+            full_limit
+        };
         if kept.len() < limit_now {
             let room = limit_now - kept.len();
             kept.extend(chunk.value.into_iter().take(room));
