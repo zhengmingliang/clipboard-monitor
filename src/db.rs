@@ -551,15 +551,16 @@ impl Database {
 
     pub fn get_blob_for_event(&self, event_id: i64) -> Result<Option<(String, Vec<u8>)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.blob, COALESCE(e.app_name, 'file')
+            "SELECT c.blob, COALESCE(e.app_name, 'file'), COALESCE(c.meta_json, '')
              FROM events e JOIN contents c ON c.id = e.content_id
              WHERE e.id = ?1 AND c.blob IS NOT NULL",
         )?;
         let row = stmt
             .query_row(params![event_id], |r| {
                 let blob: Vec<u8> = r.get(0)?;
-                let name: String = r.get(1)?;
-                Ok((name, blob))
+                let app_name: String = r.get(1)?;
+                let meta_json: String = r.get(2)?;
+                Ok((download_filename(&meta_json, &app_name), blob))
             })
             .optional()?;
         Ok(row)
@@ -851,6 +852,33 @@ fn restrict_db(path: &Path) {
             restrict_file(&p);
         }
     }
+}
+
+/// 从事件元数据推断下载文件名：优先文件列表第一个条目名，
+/// 其次条目路径的文件名部分，再退回应用名，最后 "file"。
+fn download_filename(meta_json: &str, app_name: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(meta_json) {
+        let entry = &v["files"]["entries"][0];
+        if let Some(name) = entry["name"].as_str() {
+            let name = name.trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+        if let Some(path) = entry["path"].as_str() {
+            if let Some(base) = std::path::Path::new(path).file_name() {
+                let base = base.to_string_lossy().into_owned();
+                if !base.is_empty() {
+                    return base;
+                }
+            }
+        }
+    }
+    let app = app_name.trim();
+    if !app.is_empty() && app != "file" {
+        return app.to_string();
+    }
+    "file".to_string()
 }
 
 #[cfg(test)]
@@ -1158,5 +1186,25 @@ mod tests {
             .unwrap();
         assert_eq!(pending_sum, 1, "历史占位读取应被回填为 pending");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn download_filename_prefers_file_entry() {
+        assert_eq!(
+            download_filename(
+                r#"{"files":{"entries":[{"name":"a b.txt","path":"/tmp/a b.txt"}]}}"#,
+                "gedit"
+            ),
+            "a b.txt"
+        );
+        assert_eq!(
+            download_filename(
+                r#"{"files":{"entries":[{"path":"/tmp/x/y.zip"}]}}"#,
+                "gedit"
+            ),
+            "y.zip"
+        );
+        assert_eq!(download_filename("{}", "gedit"), "gedit");
+        assert_eq!(download_filename("not json", ""), "file");
     }
 }

@@ -108,6 +108,7 @@ fn reject_overloaded(mut stream: TcpStream) {
             body: json!({"error": "连接数已达上限，请稍后重试"})
                 .to_string()
                 .into_bytes(),
+            content_disposition: None,
         },
     );
 }
@@ -178,6 +179,7 @@ fn handle_client(app: Arc<App>, mut stream: TcpStream, port: u16) -> Result<()> 
                 status: 403,
                 content_type: "application/json; charset=utf-8",
                 body: json!({"error": err.to_string()}).to_string().into_bytes(),
+                content_disposition: None,
             },
         );
     }
@@ -197,6 +199,7 @@ fn handle_client(app: Arc<App>, mut stream: TcpStream, port: u16) -> Result<()> 
                     status,
                     content_type: "application/json; charset=utf-8",
                     body: json!({"error": err.to_string()}).to_string().into_bytes(),
+                    content_disposition: None,
                 },
             )
         }
@@ -207,6 +210,8 @@ struct Response {
     status: u16,
     content_type: &'static str,
     body: Vec<u8>,
+    /// 附加 Content-Disposition 头（文件下载用）。
+    content_disposition: Option<String>,
 }
 
 /// DNS 重绑定与跨站请求防护。
@@ -307,11 +312,17 @@ fn write_response(stream: &mut TcpStream, resp: Response) -> Result<()> {
         503 => "Service Unavailable",
         _ => "Error",
     };
-    let head = format!(
-        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n",
+    let mut head = format!(
+        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\n",
         resp.status,
         resp.content_type,
         resp.body.len()
+    );
+    if let Some(cd) = &resp.content_disposition {
+        head.push_str(&format!("Content-Disposition: {cd}\r\n"));
+    }
+    head.push_str(
+        "Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n",
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(&resp.body)?;
@@ -324,6 +335,7 @@ fn dispatch(app: &App, method: &str, path: &str, query: &str, body: &[u8]) -> Re
             status: 200,
             content_type: "text/html; charset=utf-8",
             body: INDEX_HTML.as_bytes().to_vec(),
+            content_disposition: None,
         });
     }
     if method == "GET" && (path == "/api/health" || path == "/api/status") {
@@ -372,11 +384,11 @@ fn dispatch(app: &App, method: &str, path: &str, query: &str, body: &[u8]) -> Re
             let Some((name, bytes)) = db.get_blob_for_event(id)? else {
                 bail!("事件不存在或没有文件内容");
             };
-            let _ = name;
             return Ok(Response {
                 status: 200,
                 content_type: "application/octet-stream",
                 body: bytes,
+                content_disposition: Some(content_disposition(&name)),
             });
         }
         if method == "GET" {
@@ -496,6 +508,7 @@ fn json_ok(value: Value) -> Response {
         status: 200,
         content_type: "application/json; charset=utf-8",
         body: value.to_string().into_bytes(),
+        content_disposition: None,
     }
 }
 
@@ -516,6 +529,24 @@ fn percent_decode(s: &str) -> String {
     percent_encoding::percent_decode_str(&bytes)
         .decode_utf8_lossy()
         .into_owned()
+}
+
+/// 下载头：ASCII 兜底加 RFC 5987 UTF-8 扩展，兼容中文文件名。
+fn content_disposition(name: &str) -> String {
+    let name = name.trim();
+    let fallback: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() && c != '"' && c != '\\' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let utf8 =
+        percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC).to_string();
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{utf8}")
 }
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
