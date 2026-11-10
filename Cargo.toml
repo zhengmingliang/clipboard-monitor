@@ -11,8 +11,12 @@ name = "clipboard-monitor"
 path = "src/main.rs"
 
 [dependencies]
+aes-gcm = "0.10.3"
 anyhow = "1.0.104"
 arboard = "3.7.0"
+base64 = "0.22.1"
+hex = "0.4.3"
+zeroize = "1.8.2"
 ctrlc = { version = "3.5.2", features = ["termination"] }
 fs2 = "0.4.3"
 percent-encoding = "2.3.2"
@@ -35,6 +39,7 @@ clipboard-win = "5.4.3"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    "Win32_Security_Cryptography",
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",

@@ -301,6 +301,8 @@
         <li>图片和其它二进制：只保存格式、尺寸和大小，不保存像素。</li>
       <li>打开一条写入，流转里列出之后读过这份内容的进程。点其中一条会打开对应记录。</li>
       </ul>
+      <h2>加密与搜索</h2>
+      <p>剪贴板正文（文本、图片、元数据、摘要）用 AES-256-GCM 加密后落库，密钥由 Windows DPAPI / macOS Keychain / Linux 数据目录里的 0600 文件保管。时间、类型、应用名等列仍明文以便筛选。<strong>备份数据目录时必须连同密钥一起复制</strong>，否则数据库无法解密。搜索框由 FTS5 全文索引驱动，支持中文子串；索引的是解密后的明文，密文不会写进索引。</p>
       <h2>怎么停</h2>
       <p>页面上的开关只暂停记录，进程还在。命令行 <code>clipboard-monitor stop</code> 会退出进程。</p>
       <h2>限制</h2>
@@ -434,8 +436,9 @@ async function refreshStatus() {
   const err = s.last_error ? ` · ${s.last_error}` : "";
   const backend = { x11: "Linux/X11", windows: "Windows", macos: "macOS" }[s.backend] || s.backend;
   const reads = state.capabilities.reads ? ` · 读取 ${s.reads_seen}` : (state.capabilities.reads_inferred ? ` · 推断读取 ${s.reads_seen}` : "");
+  const security = `${s.encrypted ? " · 正文已加密" : " · 正文未加密"}${s.full_text_search ? " · 全文检索" : ""}`;
   $("meta").textContent =
-    `${backend} · 写入 ${s.writes_seen}${reads} · 近 24 小时写 ${db.writes_24h || 0} · 保留 ${s.retention_days} 天${err}`;
+    `${backend} · 写入 ${s.writes_seen}${reads} · 近 24 小时写 ${db.writes_24h || 0} · 保留 ${s.retention_days} 天${security}${err}`;
   // 可靠读取或推断读取任一可用时都允许按 op=read 筛选。
   const readFilter = state.capabilities.reads || state.capabilities.reads_inferred;
   document.querySelectorAll('#f-op option[value="read"], #c-op option[value="read"]').forEach(el => {

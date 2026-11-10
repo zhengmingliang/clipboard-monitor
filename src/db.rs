@@ -173,10 +173,35 @@ pub struct CleanupSpec {
 pub struct Database {
     conn: Connection,
     path: PathBuf,
+    /// None = 明文模式（仅测试用）。生产路径总是 Some。
+    key: Option<crate::crypto::DbKey>,
 }
 
+/// 迁移/重建索引时批量读取的行类型。
+type ContentRow = (i64, Option<String>, Option<String>, Option<Vec<u8>>);
+type FtsRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 impl Database {
+    /// 明文打开，仅用于单元测试。生产代码必须用 [`Database::open_encrypted`]。
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_inner(path, None)
+    }
+
+    /// 生产入口：加载/创建系统钥匙串保护的密钥，加密正文后再打开数据库。
+    /// 首次在旧库上启用时会自动把历史明文行重加密（渐进迁移）。
+    pub fn open_encrypted(path: &Path) -> Result<Self> {
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let key = crate::crypto::DbKey::load_or_create(dir).context("加载数据库加密密钥")?;
+        Self::open_inner(path, Some(key))
+    }
+
+    fn open_inner(path: &Path, key: Option<crate::crypto::DbKey>) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
             restrict_dir(dir);
@@ -196,15 +221,198 @@ impl Database {
         )?;
         conn.execute_batch(SCHEMA)?;
         Self::migrate(&conn)?;
-        restrict_db(path);
-        Ok(Self {
+        Self::ensure_fts(&conn)?;
+        let mut db = Self {
             conn,
             path: path.to_path_buf(),
-        })
+            key,
+        };
+        if db.key.is_some() {
+            db.migrate_plaintext_to_encrypted()?;
+            db.rebuild_fts()?;
+        }
+        restrict_db(path);
+        Ok(db)
+    }
+
+    /// 把历史明文 contents / events 行重加密。只处理不带 `enc:v1:` 前缀的
+    /// 值，重复运行是幂等的；中途失败靠"前缀判定"下次继续。
+    fn migrate_plaintext_to_encrypted(&mut self) -> Result<()> {
+        let key = self.key.as_ref().unwrap();
+        // contents：body / meta_json / blob
+        let mut stmt = self.conn.prepare(
+            "SELECT id, body, meta_json, blob FROM contents
+             WHERE (body IS NOT NULL AND body NOT LIKE 'enc:v1:%')
+                OR (meta_json IS NOT NULL AND meta_json NOT LIKE 'enc:v1:%')
+                OR (blob IS NOT NULL AND length(blob) > 0)",
+        )?;
+        let rows: Vec<ContentRow> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        for (id, body, meta, blob) in rows {
+            let enc_body = key.encrypt_text(body.as_deref())?;
+            let enc_meta = key
+                .encrypt_text(meta.as_deref())?
+                .unwrap_or_else(|| "{}".into());
+            let enc_blob = blob.as_deref().map(|b| key.encrypt(b)).transpose()?;
+            self.conn.execute(
+                "UPDATE contents SET body=?1, meta_json=?2, blob=?3 WHERE id=?4",
+                params![
+                    enc_body,
+                    enc_meta,
+                    enc_blob.as_deref().map(|s| s.as_bytes().to_vec()),
+                    id
+                ],
+            )?;
+        }
+        // events.summary
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, summary FROM events WHERE summary IS NOT NULL AND summary NOT LIKE 'enc:v1:%'")?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        for (id, summary) in rows {
+            let enc = key.encrypt(summary.as_bytes())?;
+            self.conn
+                .execute("UPDATE events SET summary=?1 WHERE id=?2", params![enc, id])?;
+        }
+        Ok(())
+    }
+
+    /// 加密字段的写入助手。明文模式下原样返回。
+    fn enc_text(&self, value: Option<&str>) -> Result<Option<String>> {
+        match &self.key {
+            Some(key) => key.encrypt_text(value),
+            None => Ok(value.map(|s| s.to_string())),
+        }
+    }
+
+    fn enc_bytes(&self, value: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        match (&self.key, value) {
+            (Some(key), Some(v)) => Ok(Some(key.encrypt(v)?.into_bytes())),
+            (Some(_), None) => Ok(None),
+            (None, v) => Ok(v.map(|b| b.to_vec())),
+        }
+    }
+
+    fn dec_text(&self, value: Option<String>) -> Result<Option<String>> {
+        match &self.key {
+            Some(key) => key.decrypt_text(value.as_deref()),
+            None => Ok(value),
+        }
+    }
+
+    fn dec_bytes(&self, value: Option<Vec<u8>>) -> Result<Option<Vec<u8>>> {
+        match (&self.key, value) {
+            (Some(key), Some(v)) => {
+                let text = String::from_utf8(v).context("加密 blob 不是 UTF-8")?;
+                Ok(Some(key.decrypt(&text)?))
+            }
+            (Some(_), None) | (None, None) => Ok(None),
+            (None, Some(v)) => Ok(Some(v)),
+        }
+    }
+
+    /// 一次 Captured 的四个敏感列，统一加密后返回，供各写入路径复用。
+    fn stored_content(&self, cap: &Captured) -> Result<(Option<String>, Option<Vec<u8>>, String)> {
+        let body = self.enc_text(cap.body.as_deref())?;
+        let blob = self.enc_bytes(cap.blob.as_deref())?;
+        let meta = self
+            .enc_text(Some(cap.meta_json.as_str()))?
+            .unwrap_or_else(|| "{}".into());
+        Ok((body, blob, meta))
+    }
+
+    fn stored_summary(&self, summary: &str) -> Result<String> {
+        Ok(self.enc_text(Some(summary))?.unwrap_or_default())
+    }
+
+    /// 解密一个从 SQL 直接映射出来的 EventRow 的 summary。
+    fn decrypt_row(&self, mut row: EventRow) -> Result<EventRow> {
+        row.summary = self.dec_text(Some(row.summary))?.unwrap_or_default();
+        Ok(row)
+    }
+
+    /// FTS5 虚拟表 + 同步触发器。索引的是**解密后的**正文，由 Rust 侧在
+    /// 写入时显式维护，避免把密文写进索引（那样既搜不到也泄露长度）。
+    fn ensure_fts(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+                body, summary, app_name, targets,
+                content='', contentless_delete=1, tokenize='trigram'
+             );",
+        )?;
+        Ok(())
+    }
+
+    /// 重建 FTS 索引（迁移后调用；也供写入路径增量维护失败时兜底）。
+    /// 索引按 contents.id 作为 rowid，一条 content 对应一行（正文 + 首个
+    /// 关联事件的应用名/格式）。
+    fn rebuild_fts(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.body,
+                    (SELECT summary FROM events e WHERE e.content_id = c.id ORDER BY e.id LIMIT 1),
+                    (SELECT app_name FROM events e WHERE e.content_id = c.id ORDER BY e.id LIMIT 1),
+                    (SELECT targets FROM events e WHERE e.content_id = c.id ORDER BY e.id LIMIT 1)
+             FROM contents c",
+        )?;
+        let rows: Vec<FtsRow> = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        self.conn.execute("DELETE FROM events_fts", [])?;
+        for (id, body, summary, app, targets) in rows {
+            let body = self.fts_text(body)?;
+            let summary = self.fts_text(summary)?;
+            self.conn.execute(
+                "INSERT INTO events_fts(rowid, body, summary, app_name, targets) VALUES (?1,?2,?3,?4,?5)",
+                params![id, body, summary, app.unwrap_or_default(), targets.unwrap_or_default()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 写入/更新 contents 时增量维护 FTS 行。用**解密后的**明文建索引，
+    /// 绝不能把密文写进索引（既搜不到也泄露长度信息）。
+    fn fts_upsert_content(&self, id: i64, cap: &Captured) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM events_fts WHERE rowid = ?1", params![id])?;
+        self.conn.execute(
+            "INSERT INTO events_fts(rowid, body, summary, app_name, targets) VALUES (?1,?2,?3,'','')",
+            params![
+                id,
+                cap.body.as_deref().unwrap_or_default(),
+                cap.summary
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 从数据库取出的可能是密文或明文；统一转成可索引文本。
+    fn fts_text(&self, raw: Option<String>) -> Result<String> {
+        let Some(text) = raw else {
+            return Ok(String::new());
+        };
+        match &self.key {
+            Some(key) if text.starts_with("enc:v1:") => {
+                Ok(String::from_utf8_lossy(&key.decrypt(&text)?).into_owned())
+            }
+            _ => Ok(text),
+        }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 当前数据库是否启用了字段级加密（供 /api/status 展示）。
+    pub fn is_encrypted(&self) -> bool {
+        self.key.is_some()
     }
 
     /// 仅供测试注入失败场景（如 RAISE(ABORT) 触发器）。
@@ -241,6 +449,7 @@ impl Database {
     }
 
     pub fn insert_content(&self, cap: &Captured, ts_ms: i64) -> Result<i64> {
+        let (body, blob, meta) = self.stored_content(cap)?;
         self.conn.execute(
             "INSERT INTO contents (sha256, content_type, size_bytes, truncated, body, blob, meta_json, created_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -249,16 +458,19 @@ impl Database {
                 cap.content_type,
                 cap.size as i64,
                 cap.truncated as i32,
-                cap.body,
-                cap.blob,
-                cap.meta_json,
+                body,
+                blob,
+                meta,
                 ts_ms,
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        self.fts_upsert_content(id, cap)?;
+        Ok(id)
     }
 
     pub fn update_content(&self, id: i64, cap: &Captured) -> Result<()> {
+        let (body, blob, meta) = self.stored_content(cap)?;
         self.conn.execute(
             "UPDATE contents
              SET sha256=?1, content_type=?2, size_bytes=?3, truncated=?4, body=?5, blob=?6, meta_json=?7
@@ -268,16 +480,18 @@ impl Database {
                 cap.content_type,
                 cap.size as i64,
                 cap.truncated as i32,
-                cap.body,
-                cap.blob,
-                cap.meta_json,
+                body,
+                blob,
+                meta,
                 id,
             ],
         )?;
+        self.fts_upsert_content(id, cap)?;
         Ok(())
     }
 
     pub fn insert_event(&self, ev: &NewEvent) -> Result<i64> {
+        let summary = self.stored_summary(&ev.summary)?;
         self.conn.execute(
             "INSERT INTO events (
                 ts_ms, op, selection, pid, app_name, wm_class, exec_path, window_id,
@@ -302,7 +516,7 @@ impl Database {
                 ev.content_id,
                 ev.content_type,
                 ev.content_size as i64,
-                ev.summary,
+                summary,
                 ev.targets,
                 ev.source_app,
                 ev.source_pid,
@@ -328,6 +542,8 @@ impl Database {
         ev: &NewEvent,
         ts_ms: i64,
     ) -> Result<(i64, i64)> {
+        let (body, blob, meta) = self.stored_content(cap)?;
+        let summary = self.stored_summary(&ev.summary)?;
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO contents (sha256, content_type, size_bytes, truncated, body, blob, meta_json, created_ms)
@@ -337,9 +553,9 @@ impl Database {
                 cap.content_type,
                 cap.size as i64,
                 cap.truncated as i32,
-                cap.body,
-                cap.blob,
-                cap.meta_json,
+                body,
+                blob,
+                meta,
                 ts_ms,
             ],
         )?;
@@ -368,7 +584,7 @@ impl Database {
                 content_id,
                 ev.content_type,
                 ev.content_size as i64,
-                ev.summary,
+                summary,
                 ev.targets,
                 ev.source_app,
                 ev.source_pid,
@@ -382,6 +598,10 @@ impl Database {
         )?;
         let event_id = tx.last_insert_rowid();
         tx.commit()?;
+        // FTS 增量维护在事务提交后做：索引明文，失败只记警告不影响落库。
+        if let Err(err) = self.fts_upsert_content(content_id, cap) {
+            crate::log_warn(format!("更新全文索引失败: {err:#}"));
+        }
         Ok((content_id, event_id))
     }
 
@@ -400,6 +620,7 @@ impl Database {
         truncated: bool,
         pending: bool,
     ) -> Result<()> {
+        let enc_summary = self.stored_summary(summary)?;
         self.conn.execute(
             "UPDATE events
              SET targets=?1, summary=?2, content_type=?3, content_size=?4, content_id=?5,
@@ -407,7 +628,7 @@ impl Database {
              WHERE id=?11",
             params![
                 targets,
-                summary,
+                enc_summary,
                 content_type,
                 content_size as i64,
                 content_id,
@@ -423,6 +644,7 @@ impl Database {
     }
 
     pub fn apply_capture_to_events(&self, content_id: i64, cap: &Captured) -> Result<()> {
+        let enc_summary = self.stored_summary(&cap.summary)?;
         self.conn.execute(
             "UPDATE events
              SET content_type=?1, content_size=?2, summary=?3, truncated=?4, pending=0,
@@ -433,12 +655,16 @@ impl Database {
             params![
                 cap.content_type,
                 cap.size as i64,
-                cap.summary,
+                enc_summary,
                 cap.truncated as i32,
                 cap.targets.join(", "),
                 content_id,
             ],
         )?;
+        // 占位内容此时才补全，同步刷新 FTS 索引里的正文/摘要。
+        if let Err(err) = self.fts_upsert_content(content_id, cap) {
+            crate::log_warn(format!("更新全文索引失败: {err:#}"));
+        }
         Ok(())
     }
 
@@ -474,7 +700,7 @@ impl Database {
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), map_event)?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            out.push(self.decrypt_row(row?)?);
         }
         Ok((out, total))
     }
@@ -510,6 +736,11 @@ impl Database {
             .optional()?;
         drop(stmt);
         if let Some(detail) = row.as_mut() {
+            detail.event.summary = self
+                .dec_text(Some(detail.event.summary.clone()))?
+                .unwrap_or_default();
+            detail.body = self.dec_text(detail.body.take())?;
+            detail.meta_json = self.dec_text(detail.meta_json.take())?;
             detail.flow = self.event_flow(&detail.event)?;
         }
         Ok(row)
@@ -561,7 +792,7 @@ impl Database {
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), map_event)?;
         let mut reads = Vec::new();
         for row in rows {
-            reads.push(hop_from_event(&row?));
+            reads.push(hop_from_event(&self.decrypt_row(row?)?));
         }
         let reads_limited = reads.len() as i64 > READ_LIMIT;
         if reads_limited {
@@ -610,11 +841,11 @@ impl Database {
     fn hop_by_id(&self, id: i64) -> Result<Option<FlowHop>> {
         let sql = format!("SELECT {EVENT_COLS} FROM events e WHERE e.id = ?1");
         let mut stmt = self.conn.prepare(&sql)?;
-        let row = stmt
-            .query_row(params![id], map_event)
-            .optional()?
-            .map(|event| hop_from_event(&event));
-        Ok(row)
+        let row = stmt.query_row(params![id], map_event).optional()?;
+        Ok(match row {
+            Some(event) => Some(hop_from_event(&self.decrypt_row(event)?)),
+            None => None,
+        })
     }
 
     pub fn get_blob_for_event(&self, event_id: i64) -> Result<Option<(String, Vec<u8>)>> {
@@ -628,10 +859,15 @@ impl Database {
                 let blob: Vec<u8> = r.get(0)?;
                 let app_name: String = r.get(1)?;
                 let meta_json: String = r.get(2)?;
-                Ok((download_filename(&meta_json, &app_name), blob))
+                Ok((blob, app_name, meta_json))
             })
             .optional()?;
-        Ok(row)
+        let Some((blob, app_name, meta_json)) = row else {
+            return Ok(None);
+        };
+        let meta_json = self.dec_text(Some(meta_json))?.unwrap_or_default();
+        let blob = self.dec_bytes(Some(blob))?.unwrap_or_default();
+        Ok(Some((download_filename(&meta_json, &app_name), blob)))
     }
 
     pub fn distinct_apps(&self) -> Result<Vec<String>> {
@@ -872,11 +1108,27 @@ fn filter_clause(filter: &EventFilter) -> (String, Vec<String>) {
         wheres.push(format!("e.ts_ms <= ?{}", args.len()));
     }
     if let Some(q) = nonempty(&filter.query) {
-        args.push(format!("%{}%", escape_like(&q.to_lowercase())));
-        let idx = args.len();
-        wheres.push(format!(
-            "(LOWER(COALESCE(e.summary,'')) LIKE ?{idx} ESCAPE '\\' OR LOWER(COALESCE(c.body,'')) LIKE ?{idx} ESCAPE '\\' OR LOWER(COALESCE(e.app_name,'')) LIKE ?{idx} ESCAPE '\\' OR LOWER(COALESCE(e.targets,'')) LIKE ?{idx} ESCAPE '\\')"
-        ));
+        // 全文检索走 FTS5（索引的是解密后的明文）。trigram 分词对 ≥3 字符
+        // 的查询（含中文子串）效果好；短查询退回 LIKE 匹配应用名/格式，
+        // 那些列本身是明文，不受加密影响。
+        if q.chars().count() >= 3 {
+            let phrase = format!("\"{}\"", q.replace('"', "\"\""));
+            args.push(phrase);
+            let idx = args.len();
+            wheres.push(format!(
+                "(e.content_id IN (SELECT rowid FROM events_fts WHERE events_fts MATCH ?{idx})
+                  OR LOWER(COALESCE(e.app_name,'')) LIKE ?{idx2} ESCAPE '\\'
+                  OR LOWER(COALESCE(e.targets,'')) LIKE ?{idx2} ESCAPE '\\')",
+                idx2 = idx + 1
+            ));
+            args.push(format!("%{}%", escape_like(&q.to_lowercase())));
+        } else {
+            args.push(format!("%{}%", escape_like(&q.to_lowercase())));
+            let idx = args.len();
+            wheres.push(format!(
+                "(LOWER(COALESCE(e.app_name,'')) LIKE ?{idx} ESCAPE '\\' OR LOWER(COALESCE(e.targets,'')) LIKE ?{idx} ESCAPE '\\')"
+            ));
+        }
     }
     if wheres.is_empty() {
         ("WHERE 1=1".to_string(), args)
@@ -1376,5 +1628,187 @@ mod tests {
         drop(db);
         let _ = std::fs::remove_file(path);
         let _ = events;
+    }
+
+    fn encrypted_db() -> (Database, PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "clipmon-enc-{}-{}-{}",
+            std::process::id(),
+            crate::now_ms(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("monitor.db");
+        let db = Database::open_encrypted(&path).unwrap();
+        (db, dir)
+    }
+
+    fn sample_cap(text: &str) -> crate::classify::Captured {
+        assemble(
+            &FetchInput {
+                target_names: vec!["UTF8_STRING".into()],
+                plain: Some(text.as_bytes().to_vec()),
+                plain_total: text.len() as u64,
+                plain_mime: Some("UTF8_STRING".into()),
+                ..FetchInput::default()
+            },
+            &Limits::default(),
+        )
+    }
+
+    fn sample_event(cap: &crate::classify::Captured) -> NewEvent {
+        NewEvent {
+            ts_ms: 1000,
+            op: "write".into(),
+            selection: "CLIPBOARD".into(),
+            pid: Some(7),
+            app_name: "editor".into(),
+            wm_class: String::new(),
+            exec_path: "/usr/bin/editor".into(),
+            window_id: 3,
+            content_id: None,
+            content_type: cap.content_type.clone(),
+            content_size: cap.size,
+            summary: cap.summary.clone(),
+            targets: "UTF8_STRING".into(),
+            source_app: "editor".into(),
+            source_pid: Some(7),
+            source_event_id: None,
+            truncated: cap.truncated,
+            x_time: 0,
+            reason: "content_change".into(),
+            pending: false,
+        }
+    }
+
+    #[test]
+    fn encrypted_db_never_stores_plaintext_on_disk() {
+        let (mut db, dir) = encrypted_db();
+        let secret = "hunter2 token=AKIAEXAMPLE 中文机密";
+        let cap = sample_cap(secret);
+        let (cid, eid) = db.insert_change(&cap, &sample_event(&cap), 1000).unwrap();
+
+        // 直接读原始 SQLite 列，确认没有任何明文片段。
+        let raw_body: String = db
+            .conn
+            .query_row("SELECT body FROM contents WHERE id=?1", params![cid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let raw_summary: String = db
+            .conn
+            .query_row(
+                "SELECT summary FROM events WHERE id=?1",
+                params![eid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(raw_body.starts_with("enc:v1:"));
+        assert!(raw_summary.starts_with("enc:v1:"));
+        assert!(!raw_body.contains("hunter2"));
+        assert!(!raw_summary.contains("hunter2"));
+        let file = std::fs::read(dir.join("monitor.db")).unwrap();
+        assert!(!String::from_utf8_lossy(&file).contains("hunter2"));
+
+        // 通过公开 API 读回必须得到原文。
+        let detail = db.get_event(eid).unwrap().unwrap();
+        assert_eq!(detail.body.as_deref(), Some(secret));
+        assert_eq!(detail.event.summary, cap.summary);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn encrypted_db_supports_fts_search_and_reopening() {
+        let (mut db, dir) = encrypted_db();
+        let texts = [
+            "部署密钥 DEPLOY-KEY 与服务器地址",
+            "会议纪要：下周三评审剪贴板方案",
+            "ordinary shopping list milk and eggs",
+        ];
+        let mut ids = Vec::new();
+        for (i, t) in texts.iter().enumerate() {
+            let cap = sample_cap(t);
+            let mut ev = sample_event(&cap);
+            ev.ts_ms = 1000 + i as i64;
+            let (_, eid) = db.insert_change(&cap, &ev, ev.ts_ms).unwrap();
+            ids.push(eid);
+        }
+        let f = EventFilter {
+            query: Some("部署密钥".into()),
+            ..Default::default()
+        };
+        let (rows, total) = db.query_events(&f, 10, 0).unwrap();
+        assert_eq!(total, 1, "FTS5 应命中中文短语");
+        assert_eq!(rows[0].id, ids[0]);
+        let f2 = EventFilter {
+            query: Some("milk".into()),
+            ..Default::default()
+        };
+        let (_, total2) = db.query_events(&f2, 10, 0).unwrap();
+        assert_eq!(total2, 1, "FTS5 应命中英文单词");
+        drop(db);
+
+        // 重新打开同一个加密库，密钥从数据目录恢复，历史记录仍可读。
+        let db2 = Database::open_encrypted(&dir.join("monitor.db")).unwrap();
+        let detail = db2.get_event(ids[1]).unwrap().unwrap();
+        assert_eq!(detail.body.as_deref(), Some(texts[1]));
+        drop(db2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_plaintext_rows_are_readable_after_encryption_enabled() {
+        // 先用明文模式写入历史数据（模拟旧版本），再用加密模式打开。
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "clipmon-migrate-{}-{}-{}",
+            std::process::id(),
+            crate::now_ms(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("monitor.db");
+        let old_id = {
+            let mut old = Database::open(&path).unwrap();
+            let cap = sample_cap("旧版本明文记录 legacy-secret");
+            let (_, eid) = old.insert_change(&cap, &sample_event(&cap), 500).unwrap();
+            eid
+        };
+        let db = Database::open_encrypted(&path).unwrap();
+        let detail = db.get_event(old_id).unwrap().unwrap();
+        assert_eq!(detail.body.as_deref(), Some("旧版本明文记录 legacy-secret"));
+        // 迁移后该行应已重加密。
+        let raw: String = db
+            .conn
+            .query_row("SELECT body FROM contents LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(raw.starts_with("enc:v1:"));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wrong_key_cannot_read_encrypted_database() {
+        let (mut db, dir) = encrypted_db();
+        let cap = sample_cap("top-secret-value");
+        let (_, eid) = db.insert_change(&cap, &sample_event(&cap), 1000).unwrap();
+        drop(db);
+        // 换掉密钥文件，模拟密钥丢失/不匹配。
+        std::fs::write(
+            dir.join("master.key"),
+            format!("key:v1:{}", "00".repeat(32)),
+        )
+        .unwrap();
+        // 密钥不匹配时打开就应失败（迁移阶段解密失败），避免静默丢数据。
+        let result = Database::open_encrypted(&dir.join("monitor.db"));
+        assert!(
+            result.is_err(),
+            "密钥不匹配时应明确报错而不是静默继续: {eid}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

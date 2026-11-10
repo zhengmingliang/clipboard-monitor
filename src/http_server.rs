@@ -481,6 +481,8 @@ fn status_json(app: &App) -> Result<Value> {
         "display": if cfg!(target_os = "linux") { std::env::var("DISPLAY").unwrap_or_default() } else { String::new() },
         "backend": crate::monitor::BACKEND,
         "changes_ready": app.changes_ok.load(Ordering::Relaxed),
+        "encrypted": db.is_encrypted(),
+        "full_text_search": true,
         "capabilities": {
             "text": true,
             "image": true,

@@ -124,7 +124,7 @@ fn serve(opt: Opt) -> Result<()> {
         cfg.validate()?;
     }
     let db_path = opt.data_dir.join("monitor.db");
-    let db = Database::open(&db_path)?;
+    let db = Database::open_encrypted(&db_path)?;
     let app = App::new(db, cfg, opt.config_path.clone());
     write_pid(&opt.data_dir)?;
     let threads = monitor::spawn(Arc::clone(&app))?;
@@ -276,7 +276,7 @@ fn print_status(opt: &Opt) -> Result<()> {
 }
 
 fn cleanup_cli(opt: &Opt) -> Result<()> {
-    let db = Database::open(&opt.data_dir.join("monitor.db"))?;
+    let db = Database::open_encrypted(&opt.data_dir.join("monitor.db"))?;
     let spec = CleanupSpec {
         from_ms: opt
             .from

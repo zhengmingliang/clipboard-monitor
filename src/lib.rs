@@ -6,6 +6,7 @@
 
 pub mod classify;
 pub mod config;
+pub mod crypto;
 pub mod db;
 #[cfg(target_os = "linux")]
 pub mod fetch;
