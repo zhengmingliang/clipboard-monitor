@@ -34,6 +34,9 @@ use x11rb::protocol::Event;
 const REORDER: Duration = Duration::from_millis(40);
 const READ_BURST: i64 = 300;
 
+/// 抓取完成前的写入占位摘要；读取事件据此标记 pending，等抓取回填。
+const PENDING_SUMMARY: &str = "内容获取中";
+
 struct RawWrite {
     seq: u64,
     wall_ms: i64,
@@ -615,7 +618,7 @@ fn handle_write(
     let placeholder = if ev.owner == 0 {
         empty_capture()
     } else {
-        Captured::placeholder("内容获取中")
+        Captured::placeholder(PENDING_SUMMARY)
     };
     // 白名单程序只留一条"内容未记录"的快照占位，不插内容行、不下发抓取，
     // 保证剪贴板正文完全不落盘。
@@ -649,6 +652,7 @@ fn handle_write(
                 truncated: false,
                 x_time: ev.x_time,
                 reason: ev.reason.to_string(),
+                pending: false,
             })?;
             app.counters.writes.fetch_add(1, Ordering::Relaxed);
             Some(event_id)
@@ -750,6 +754,7 @@ fn handle_read(
                 snap.as_ref().and_then(|s| s.source_pid),
                 snap.as_ref().and_then(|s| s.event_id),
                 snap.as_ref().is_some_and(|s| s.truncated),
+                snap.as_ref().is_some_and(|s| s.summary == PENDING_SUMMARY),
             )?;
             return Ok(());
         }
@@ -783,6 +788,7 @@ fn handle_read(
         truncated: snap.as_ref().is_some_and(|s| s.truncated),
         x_time: ev.x_time,
         reason: "read".into(),
+        pending: snap.as_ref().is_some_and(|s| s.summary == PENDING_SUMMARY),
     })?;
     drop(db);
     bursts.insert(
@@ -806,7 +812,7 @@ fn read_summary(snap: Option<&Snap>, targets: &[String]) -> String {
     let body = snap
         .map(|s| s.summary.as_str())
         .filter(|s| !s.is_empty())
-        .unwrap_or("内容获取中");
+        .unwrap_or(PENDING_SUMMARY);
     let mut text = format!("来自 {source}：{body}");
     if !targets.is_empty() {
         text.push_str(" · 目标 ");

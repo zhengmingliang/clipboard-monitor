@@ -202,6 +202,7 @@ impl App {
                 truncated: captured.truncated,
                 x_time: 0,
                 reason: "changed".into(),
+                pending: false,
             })?;
             (content_id, event_id)
         };

@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS events (
     truncated INTEGER NOT NULL DEFAULT 0,
     x_time INTEGER,
     reason TEXT,
-    created_ms INTEGER NOT NULL
+    created_ms INTEGER NOT NULL,
+    pending INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts_ms);
@@ -76,6 +77,8 @@ pub struct NewEvent {
     pub truncated: bool,
     pub x_time: u32,
     pub reason: String,
+    /// 占位摘要等待抓取回填。回填后清零，不再依赖 summary 文本匹配。
+    pub pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -192,6 +195,7 @@ impl Database {
              PRAGMA wal_autocheckpoint=1000;",
         )?;
         conn.execute_batch(SCHEMA)?;
+        Self::migrate(&conn)?;
         restrict_db(path);
         Ok(Self {
             conn,
@@ -212,6 +216,23 @@ impl Database {
 
     pub fn file_size(&self) -> u64 {
         db_file_size(&self.path)
+    }
+
+    /// 旧库补 pending 列。历史占位行用摘要文本近似回填一次。
+    fn migrate(conn: &Connection) -> Result<()> {
+        let has_pending: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('events') WHERE name = 'pending'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_pending == 0 {
+            conn.execute_batch(
+                "ALTER TABLE events ADD COLUMN pending INTEGER NOT NULL DEFAULT 0;
+                 UPDATE events SET pending = 1
+                 WHERE op = 'read' AND summary LIKE '%内容获取中%';",
+            )?;
+        }
+        Ok(())
     }
 
     pub fn checkpoint(&self) {
@@ -261,11 +282,13 @@ impl Database {
             "INSERT INTO events (
                 ts_ms, op, selection, pid, app_name, wm_class, exec_path, window_id,
                 content_id, content_type, content_size, summary, targets,
-                source_app, source_pid, source_event_id, truncated, x_time, reason, created_ms
+                source_app, source_pid, source_event_id, truncated, x_time, reason, created_ms,
+                pending
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                 ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17, ?18, ?19, ?20
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                ?21
              )",
             params![
                 ev.ts_ms,
@@ -288,6 +311,7 @@ impl Database {
                 ev.x_time as i64,
                 ev.reason,
                 ev.ts_ms,
+                ev.pending as i32,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -306,12 +330,13 @@ impl Database {
         source_pid: Option<i32>,
         source_event_id: Option<i64>,
         truncated: bool,
+        pending: bool,
     ) -> Result<()> {
         self.conn.execute(
             "UPDATE events
              SET targets=?1, summary=?2, content_type=?3, content_size=?4, content_id=?5,
-                 source_app=?6, source_pid=?7, source_event_id=?8, truncated=?9
-             WHERE id=?10",
+                 source_app=?6, source_pid=?7, source_event_id=?8, truncated=?9, pending=?10
+             WHERE id=?11",
             params![
                 targets,
                 summary,
@@ -322,6 +347,7 @@ impl Database {
                 source_pid,
                 source_event_id,
                 truncated as i32,
+                pending as i32,
                 id,
             ],
         )?;
@@ -331,10 +357,11 @@ impl Database {
     pub fn apply_capture_to_events(&self, content_id: i64, cap: &Captured) -> Result<()> {
         self.conn.execute(
             "UPDATE events
-             SET content_type=?1, content_size=?2, summary=?3, truncated=?4, targets=CASE
-                 WHEN op='write' AND ?5 != '' THEN ?5 ELSE targets END
+             SET content_type=?1, content_size=?2, summary=?3, truncated=?4, pending=0,
+                 targets=CASE
+                     WHEN op='write' AND ?5 != '' THEN ?5 ELSE targets END
              WHERE content_id=?6
-               AND (op='write' OR summary LIKE '%内容获取中%' OR summary = '')",
+               AND (op='write' OR pending=1)",
             params![
                 cap.content_type,
                 cap.size as i64,
@@ -885,6 +912,7 @@ mod tests {
             truncated: cap.truncated,
             x_time: 0,
             reason: "owner_change".into(),
+            pending: false,
         })
         .unwrap()
     }
@@ -965,6 +993,7 @@ mod tests {
             truncated: false,
             x_time: 0,
             reason: "read".into(),
+            pending: false,
         })
         .unwrap()
     }
@@ -1011,6 +1040,123 @@ mod tests {
         let (db, path) = tmp_db();
         let err = db.cleanup(&CleanupSpec::default()).unwrap_err();
         assert!(err.to_string().contains("拒绝"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn apply_capture_updates_only_pending_reads() {
+        let (db, path) = tmp_db();
+        let placeholder = Captured::placeholder("内容获取中");
+        let cid = db.insert_content(&placeholder, 1_700_000_000_000).unwrap();
+        let mk = |op: &str, summary: &str, pending: bool| NewEvent {
+            ts_ms: 1_700_000_000_000,
+            op: op.into(),
+            selection: "CLIPBOARD".into(),
+            pid: Some(1),
+            app_name: "gedit".into(),
+            wm_class: String::new(),
+            exec_path: "/usr/bin/gedit".into(),
+            window_id: 1,
+            content_id: Some(cid),
+            content_type: placeholder.content_type.clone(),
+            content_size: 0,
+            summary: summary.into(),
+            targets: String::new(),
+            source_app: "gedit".into(),
+            source_pid: Some(1),
+            source_event_id: None,
+            truncated: false,
+            x_time: 0,
+            reason: "test".into(),
+            pending,
+        };
+        db.insert_event(&mk("write", "内容获取中", false)).unwrap();
+        let pending_read = db
+            .insert_event(&mk("read", "来自 gedit：内容获取中", true))
+            .unwrap();
+        let normal_read = db
+            .insert_event(&mk("read", "来自 firefox：已完成内容获取中转", false))
+            .unwrap();
+
+        let final_cap = assemble(
+            &FetchInput {
+                target_names: vec!["UTF8_STRING".into()],
+                plain: Some("内容获取中".as_bytes().to_vec()),
+                plain_total: 15,
+                plain_mime: Some("UTF8_STRING".into()),
+                ..FetchInput::default()
+            },
+            &Limits::default(),
+        );
+        db.update_content(cid, &final_cap).unwrap();
+        db.apply_capture_to_events(cid, &final_cap).unwrap();
+
+        let backfilled = db.get_event(pending_read).unwrap().unwrap();
+        assert_eq!(
+            backfilled.event.summary, final_cap.summary,
+            "pending 读应回填"
+        );
+        assert_eq!(backfilled.body.as_deref(), Some("内容获取中"));
+        let untouched = db.get_event(normal_read).unwrap().unwrap();
+        assert_eq!(
+            untouched.event.summary, "来自 firefox：已完成内容获取中转",
+            "正文恰好包含占位词的读取不应被改写"
+        );
+
+        // 回填后 pending 清零：再次回填不再改写摘要。
+        let cap2 = assemble(
+            &FetchInput {
+                target_names: vec!["UTF8_STRING".into()],
+                plain: Some(b"second".to_vec()),
+                plain_total: 6,
+                plain_mime: Some("UTF8_STRING".into()),
+                ..FetchInput::default()
+            },
+            &Limits::default(),
+        );
+        db.update_content(cid, &cap2).unwrap();
+        db.apply_capture_to_events(cid, &cap2).unwrap();
+        let still = db.get_event(pending_read).unwrap().unwrap();
+        assert_eq!(still.event.summary, final_cap.summary, "pending 已清零");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_db_is_migrated_with_pending_column() {
+        let path = std::env::temp_dir().join(format!(
+            "clipmon-legacy-{}-{}.sqlite",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_ms INTEGER NOT NULL, op TEXT NOT NULL, selection TEXT NOT NULL,
+                    pid INTEGER, app_name TEXT, wm_class TEXT, exec_path TEXT,
+                    window_id INTEGER, content_id INTEGER, content_type TEXT,
+                    content_size INTEGER, summary TEXT, targets TEXT, source_app TEXT,
+                    source_pid INTEGER, source_event_id INTEGER,
+                    truncated INTEGER NOT NULL DEFAULT 0, x_time INTEGER, reason TEXT,
+                    created_ms INTEGER NOT NULL
+                );
+                INSERT INTO events (ts_ms, op, selection, created_ms, summary)
+                    VALUES (1, 'read', 'CLIPBOARD', 1, '来自 gedit：内容获取中');
+                INSERT INTO events (ts_ms, op, selection, created_ms, summary)
+                    VALUES (2, 'read', 'CLIPBOARD', 2, '正常读取');",
+            )
+            .unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let pending_sum: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events WHERE pending = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending_sum, 1, "历史占位读取应被回填为 pending");
         let _ = std::fs::remove_file(&path);
     }
 }
