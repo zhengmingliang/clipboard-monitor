@@ -536,13 +536,23 @@ fn flush_ready(
     }
     *buf = keep;
     ready.sort_by(cmp_x_time);
+    // 单条落库失败不中断整批：其余事件继续处理，最后只上报第一个错误。
+    let mut first_err = None;
     for ev in ready {
-        match ev {
-            Incoming::Write(w) => handle_write(app, resolver, bursts, job_tx, w)?,
-            Incoming::Read(r) => handle_read(app, resolver, bursts, r)?,
+        let outcome = match ev {
+            Incoming::Write(w) => handle_write(app, resolver, bursts, job_tx, w),
+            Incoming::Read(r) => handle_read(app, resolver, bursts, r),
+        };
+        if let Err(err) = outcome {
+            if first_err.is_none() {
+                first_err = Some(err);
+            }
         }
     }
-    Ok(())
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 fn cmp_x_time(a: &Incoming, b: &Incoming) -> std::cmp::Ordering {
@@ -1022,6 +1032,58 @@ mod tests {
             let (_, total) = db.query_events(&EventFilter::default(), 10, 0).unwrap();
             assert_eq!(total, 1);
         }
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn flush_keeps_rest_of_batch_after_single_failure() {
+        let (app, dir) = test_app(Config::default());
+        {
+            let db = app.db.lock().unwrap();
+            db.exec_for_test(
+                "CREATE TRIGGER fail_one BEFORE INSERT ON events
+                 WHEN NEW.op = 'read' AND NEW.window_id = 22016
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        }
+        let (job_tx, _job_rx) = mpsc::channel();
+        let mut resolver = None;
+        let mut bursts = HashMap::new();
+        // arrived 早于重排窗口，flush 时两条都会进入同一批。
+        let arrived = Instant::now() - REORDER - Duration::from_millis(10);
+        let mut buf = Vec::new();
+        buf.push(Incoming::Read(RawRead {
+            seq: 1,
+            wall_ms: crate::now_ms(),
+            x_time: 0,
+            arrived,
+            selection_name: "CLIPBOARD".into(),
+            selection_atom: 1,
+            requestor: 22016,
+            target_atom: 2,
+            xid_base: 0x3a0_0000,
+        }));
+        buf.push(Incoming::Read(RawRead {
+            seq: 2,
+            wall_ms: crate::now_ms() + 1,
+            x_time: 0,
+            arrived,
+            selection_name: "CLIPBOARD".into(),
+            selection_atom: 1,
+            requestor: 22017,
+            target_atom: 2,
+            xid_base: 0x3a0_0000,
+        }));
+        let outcome = flush_ready(&app, &mut resolver, &mut buf, &mut bursts, &job_tx);
+        assert!(outcome.is_err(), "应把第一个错误上报给调用方");
+        let db = app.db.lock().unwrap();
+        let (rows, _) = db.query_events(&EventFilter::default(), 10, 0).unwrap();
+        let reads: Vec<_> = rows.iter().filter(|r| r.op == "read").collect();
+        assert_eq!(reads.len(), 1, "同批失败不应丢弃后续事件");
+        assert_eq!(reads[0].window_id, Some(22017));
+        drop(db);
         drop(app);
         let _ = std::fs::remove_dir_all(dir);
     }

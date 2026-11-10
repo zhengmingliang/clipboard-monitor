@@ -203,6 +203,13 @@ impl Database {
         &self.path
     }
 
+    /// 仅供测试注入失败场景（如 RAISE(ABORT) 触发器）。
+    #[cfg(test)]
+    pub(crate) fn exec_for_test(&self, sql: &str) -> Result<()> {
+        self.conn.execute_batch(sql)?;
+        Ok(())
+    }
+
     pub fn file_size(&self) -> u64 {
         db_file_size(&self.path)
     }
