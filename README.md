@@ -7,7 +7,7 @@
 | 平台 | 变化检测 | 文本 | 图片 | 额外能力 |
 | --- | --- | --- | --- | --- |
 | Windows | `WM_CLIPBOARDUPDATE`，message-only 窗口 | Unicode 文本 | 系统图片转换为 PNG 元数据 | 完整内容摘要去重 |
-| macOS | 每 200ms 检查 `NSPasteboard.changeCount` | Unicode 文本 | TIFF 等系统图片转换为 PNG 元数据 | 完整内容摘要去重 |
+| macOS | 每 200ms 检查启停状态，最多每 2 秒做一次内容摘要采样 | Unicode 文本 | TIFF 等系统图片转换为 PNG 元数据 | 完整内容摘要去重、无窗口会话兼容 |
 | Linux/X11 | XFixes 事件，空闲时不轮询内容 | 纯文本、富文本 | PNG/JPEG/GIF/WebP/BMP 等格式元数据 | PRIMARY、来源进程、ConvertSelection 读取审计 |
 
 Windows 和 macOS 不提供可靠的复制者进程归属及全局读取审计，因此界面会隐藏这些 X11 专属功能。原生 Wayland 客户端不在当前 Linux/X11 后端能力范围内；XWayland 上只能看到走 X11 的程序。
@@ -104,7 +104,7 @@ $env:CLIPBOARD_MONITOR_LOG = "debug"
 ```
 
 - **Windows**：剪贴板被其它程序临时占用时会进行 3 次短重试；持续失败会写入 `last_error` 和日志。
-- **macOS**：系统隐私设置可能要求允许终端或本程序访问剪贴板。授权后重启进程。
+- **macOS**：系统隐私设置可能要求允许终端或本程序访问剪贴板。授权后重启进程。无窗口或 SSH 会话里 `NSPasteboard.changeCount` 可能不递增，因此程序会最多每 2 秒读取一次文本/图片并计算摘要；只有摘要变化时才写日志，避免持续保存剪贴板正文。
 - **Linux**：需要 X11 会话以及 XFIXES/RECORD 扩展。可用 `echo "$XDG_SESSION_TYPE $DISPLAY"` 和 `xdpyinfo | grep -E 'RECORD|XFIXES'` 检查。RECORD 不可用只影响读取审计，XFixes 变化记录仍可运行。
 - **界面状态**：`GET /api/status` 中的 `changes_ready` 表示变化监听是否就绪，`capabilities` 列出当前后端能力，`last_error` 给出最近一次异常。
 
@@ -129,11 +129,14 @@ CLIPBOARD_MONITOR_NATIVE_LIVE=1 cargo test --release --test native_clipboard -- 
 
 ## 自动构建与 Releases
 
+[v1.0.0-rc.3](https://github.com/zhengmingliang/clipboard-monitor/releases/tag/v1.0.0-rc.3) 已通过 [Actions 42826384539](https://github.com/zhengmingliang/clipboard-monitor/actions/runs/42826384539) 完成五架构原生构建、真实文本/图片监听、解压包运行和自动发布。发布包共五个，另有 `SHA256SUMS`；下载后的校验和已全部复核，Linux x64 发布包已再次解压直接运行验证。
+
 工作流位于 [.github/workflows/release.yml](.github/workflows/release.yml)：
 
 - 推送任意分支、推送标签或手动触发时，构建 Windows x64、macOS ARM64/x64、Linux x64/ARM64。
 - 所有构建先上传为 GitHub Actions artifacts。
 - 推送标签时，自动创建对应 GitHub Release，上传五个平台的 `.zip`/`.tar.gz` 和 `SHA256SUMS`。
+- 每个构建都会执行原生文本/图片监听测试，并从解压后的发布包运行可执行文件；Linux 使用 Xvfb 提供 X11 会话。
 - 发布包包含对应架构的单文件可执行程序和本说明；Windows/macOS 包未做平台签名或公证。
 
 例如发布 `v1.0.0`：
@@ -148,5 +151,5 @@ git push origin v1.0.0
 - Linux 仅支持 X11/XWayland，不支持原生 Wayland data-control。
 - 程序如果在自己的进程里缓存旧内容，不再向 X 服务器请求，就不会产生 X11 读取记录。
 - X11 所有者如果在内容被取走前退出，对应写入会留下“没有取到内容”的说明。
-- macOS 使用轻量变化计数检查，检测延迟最多约 200ms，加内容抓取时间；Windows 消息循环每 50ms 检查一次系统通知。
+- macOS 无窗口会话中的兜底采样间隔最多约 2 秒，另加内容抓取时间；Windows 消息循环每 50ms 检查一次系统通知。
 - 同一次 X11 粘贴可能请求多个格式，300ms 内同一程序对同一选择区的读取会合并成一条。

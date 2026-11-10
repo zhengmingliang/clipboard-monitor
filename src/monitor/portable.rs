@@ -144,7 +144,7 @@ mod platform {
 
     pub(super) fn run(app: Arc<App>) {
         app.changes_ok.store(true, Ordering::Relaxed);
-        log_info("macOS 剪贴板监听已启动（NSPasteboard.changeCount）");
+        log_info("macOS 剪贴板监听已启动（内容摘要采样）");
         let mut was_enabled = false;
         let mut last_hash = None;
         let mut last_probe = Instant::now() - Duration::from_secs(1);
