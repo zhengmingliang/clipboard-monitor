@@ -152,8 +152,16 @@ fn wait_event(
     predicate: impl Fn(&Value) -> bool,
 ) -> Result<(Value, Value), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
+    let mut last_http_error = None;
     while Instant::now() < deadline {
-        let events = get_json(&format!("{base}/api/events?limit=200"))?;
+        let events = match get_json(&format!("{base}/api/events?limit=200")) {
+            Ok(events) => events,
+            Err(err) => {
+                last_http_error = Some(err);
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
         if let Some(event) = events["events"]
             .as_array()
             .into_iter()
@@ -161,10 +169,15 @@ fn wait_event(
             .find(|event| predicate(event))
         {
             let id = event["id"].as_i64().ok_or("事件 ID 无效")?;
-            let detail = get_json(&format!("{base}/api/events/{id}"))?;
-            return Ok((event.clone(), detail));
+            match get_json(&format!("{base}/api/events/{id}")) {
+                Ok(detail) => return Ok((event.clone(), detail)),
+                Err(err) => last_http_error = Some(err),
+            }
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+    if let Some(err) = last_http_error {
+        return Err(format!("等待剪贴板事件超时，最后一次 HTTP 错误: {err}").into());
     }
     Err("等待目标剪贴板事件超时".into())
 }
