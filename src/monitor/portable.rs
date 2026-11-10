@@ -159,8 +159,8 @@ mod platform {
             let enabled = app.enabled.load(Ordering::Relaxed);
             let overdue = last_probe.elapsed() >= Duration::from_secs(2);
             if enabled && (!was_enabled || overdue) {
-                // NSPasteboard.changeCount 在部分无窗口会话中不递增，
-                // 因而用低频内容摘要兜底；正常路径仍由变化计数驱动。
+                // 变化检测统一用内容摘要：NSPasteboard.changeCount 在部分
+                // 无窗口会话中不递增，不能作为唯一依据。
                 capture_and_record(&app, &mut last_hash);
                 last_probe = Instant::now();
             }

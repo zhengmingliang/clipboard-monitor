@@ -291,7 +291,7 @@
       <h2>这是什么</h2>
       <p>它记录本机剪贴板的文本与图片变化，日志留在本地 SQLite，不上传。Linux/X11 还支持来源进程、PRIMARY 选择区和读取审计。</p>
       <h2>平台差异</h2>
-      <p>Windows 使用 WM_CLIPBOARDUPDATE 通知；macOS 使用 NSPasteboard.changeCount；Linux 使用 XFixes/RECORD。Windows/macOS 不提供可靠的复制者进程归属和全局读取审计，因此界面不会显示这些能力。</p>
+      <p>Windows 使用 WM_CLIPBOARDUPDATE 通知；macOS 最多每 2 秒做一次内容摘要采样；Linux 使用 XFixes/RECORD。Windows/macOS 不提供可靠的复制者进程归属和全局读取审计，因此界面不会显示这些能力。</p>
       <h2>记录规则</h2>
       <ul>
         <li>纯文本、富文本：小于 1MB（可改）保存原文，达到上限只留大小和开头一段。</li>
@@ -302,7 +302,7 @@
       <h2>怎么停</h2>
       <p>页面上的开关只暂停记录，进程还在。命令行 <code>clipboard-monitor stop</code> 会退出进程。</p>
       <h2>限制</h2>
-      <p>图片只保存格式、尺寸和大小，不保存像素。Linux 原生 Wayland 客户端不在当前 X11 后端能力范围内；macOS 通过 200ms 间隔检查变化计数，Windows 由系统消息触发。macOS 14+ 的隐私提示可能要求用户允许本程序访问剪贴板。</p>
+      <p>图片只保存格式、尺寸和大小，不保存像素。Linux 原生 Wayland 客户端不在当前 X11 后端能力范围内；macOS 每 200ms 检查启停状态、最多每 2 秒做一次内容摘要采样，Windows 由系统消息触发。macOS 14+ 的隐私提示可能要求用户允许本程序访问剪贴板。</p>
     </div>
   </section>
 </main>
