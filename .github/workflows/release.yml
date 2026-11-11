@@ -101,6 +101,27 @@ jobs:
             cargo test --locked --release --target '${{ matrix.target }}' --test native_clipboard -- --ignored --nocapture --test-threads=1
           fi
 
+      - name: Verify start/stop graceful lifecycle and WAL checkpoint
+        env:
+          CLIPBOARD_MONITOR_LIFECYCLE_LIVE: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Windows 上这一步真正验证命名停止事件：断言 GRACEFUL_STOP=1
+          # 且没有回退到 TerminateProcess，并确认 WAL 已 checkpoint。
+          cargo test --locked --release --target '${{ matrix.target }}' --test lifecycle -- --nocapture --test-threads=1
+
+      - name: Verify Wayland ext-data-control selection/offer transfer
+        if: runner.os == 'Linux'
+        env:
+          CLIPBOARD_MONITOR_WAYLAND_LIVE: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 进程内最小 Wayland compositor + 真实 UNIX socket，验证
+          # data_offer / offer / selection / receive 管道传输全链路。
+          cargo test --locked --release --target '${{ matrix.target }}' --test wayland_e2e -- --ignored --nocapture --test-threads=1
+
       - name: Check executable starts
         shell: bash
         run: '"target/${{ matrix.target }}/release/${{ matrix.executable }}" --help'

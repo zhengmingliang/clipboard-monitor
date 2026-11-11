@@ -365,13 +365,27 @@ fn stop_daemon(opt: &Opt) -> Result<()> {
     // 没退再强杀兜底。事件不存在（旧版本进程）时直接强杀。
     #[cfg(target_os = "windows")]
     {
-        let signaled = stop_event::signal(&opt.data_dir).unwrap_or(false);
+        // serve 启动后事件可能还没创建完（start 刚返回就 stop 的竞态），
+        // 短暂重试打开，避免误判成"旧版本进程"而走强杀。
+        let mut signaled = false;
+        let signal_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < signal_deadline {
+            if stop_event::signal(&opt.data_dir).unwrap_or(false) {
+                signaled = true;
+                break;
+            }
+            if !pid_exists(pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         if signaled {
             let graceful = std::time::Instant::now() + Duration::from_secs(3);
             while std::time::Instant::now() < graceful {
                 if !pid_exists(pid) {
                     remove_pid(&opt.data_dir);
                     println!("已停止（优雅退出）");
+                    println!("GRACEFUL_STOP=1");
                     return Ok(());
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -385,6 +399,8 @@ fn stop_daemon(opt: &Opt) -> Result<()> {
         if !pid_exists(pid) {
             remove_pid(&opt.data_dir);
             println!("已停止");
+            #[cfg(unix)]
+            println!("GRACEFUL_STOP=1");
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
