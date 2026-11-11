@@ -14,7 +14,7 @@
 //! 本机 X11 会话无 Wayland compositor，因此这里只能验证编译与纯逻辑单测；
 //! 真实行为需在 Wayland 会话（KDE/GNOME/sway 等）实测。
 
-use crate::classify::{assemble, empty_capture, Captured, FetchInput};
+use crate::classify::{assemble, empty_capture, Captured, FetchInput, Limits};
 use crate::monitor::observation::{classify_event, ClipboardObservation, EventSpec};
 use crate::monitor::{limits_from, App};
 use crate::{log_debug, log_info, log_warn, now_ms};
@@ -29,7 +29,7 @@ use std::time::Duration;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::WlSeat;
-use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+use wayland_client::{event_created_child, Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_device_v1::ExtDataControlDeviceV1;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_manager_v1::ExtDataControlManagerV1;
 use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1::ExtDataControlOfferV1;
@@ -168,7 +168,11 @@ impl WaylandState {
             return;
         };
         let formats = std::mem::take(&mut self.pending_formats);
-        let captured = capture_offer(&offer, &formats, &self.app);
+        let captured = self
+            .conn
+            .as_ref()
+            .map(|c| capture_offer(&offer, &formats, &self.app, c))
+            .unwrap_or_else(|| assemble(&FetchInput::default(), &Limits::default()));
         self.record(captured, formats, false);
         self.current_offer = Some(offer);
     }
@@ -198,7 +202,12 @@ impl WaylandState {
 }
 
 /// 通过 offer.receive 的管道读取文本/图片，转成共享 Captured。
-fn capture_offer(offer: &ExtDataControlOfferV1, formats: &[String], app: &App) -> Captured {
+fn capture_offer(
+    offer: &ExtDataControlOfferV1,
+    formats: &[String],
+    app: &App,
+    conn: &Connection,
+) -> Captured {
     let limits = {
         let cfg = app.config.read().unwrap_or_else(|e| e.into_inner());
         limits_from(&cfg)
@@ -219,7 +228,7 @@ fn capture_offer(offer: &ExtDataControlOfferV1, formats: &[String], app: &App) -
         ..FetchInput::default()
     };
     if let Some(mime) = text_mime {
-        if let Some(bytes) = receive(offer, &mime) {
+        if let Some(bytes) = receive(offer, &mime, conn) {
             input.plain_total = bytes.len() as u64;
             input.plain_sha256 = Some(crate::classify::sha256_hex(&bytes));
             input.plain_mime = Some(mime.clone());
@@ -227,7 +236,7 @@ fn capture_offer(offer: &ExtDataControlOfferV1, formats: &[String], app: &App) -
         }
     }
     if let Some(mime) = image_mime {
-        if let Some(bytes) = receive(offer, &mime) {
+        if let Some(bytes) = receive(offer, &mime, conn) {
             input.image_mime = Some(mime.clone());
             input.image_size = bytes.len() as u64;
             input.image_header = bytes.into_iter().take(64 * 1024).collect();
@@ -237,7 +246,7 @@ fn capture_offer(offer: &ExtDataControlOfferV1, formats: &[String], app: &App) -
 }
 
 /// 用 pipe 向 source 请求指定 MIME 数据，读到 EOF 或超时/上限。
-fn receive(offer: &ExtDataControlOfferV1, mime: &str) -> Option<Vec<u8>> {
+fn receive(offer: &ExtDataControlOfferV1, mime: &str, conn: &Connection) -> Option<Vec<u8>> {
     // 用 libc pipe（项目已有 cfg(unix) 的 libc 依赖），把写端交给 compositor，
     // 读端设非阻塞后轮询，避免恶意 source 不写数据导致事件线程永久卡住。
     let mut fds = [0i32; 2];
@@ -248,7 +257,14 @@ fn receive(offer: &ExtDataControlOfferV1, mime: &str) -> Option<Vec<u8>> {
     let write_fd = fds[1];
     let owned: OwnedFd = unsafe { OwnedFd::from_raw_fd(write_fd) };
     offer.receive(mime.to_string(), owned.as_fd());
-    // 请求已发送，写端必须关闭，source 写完才会让读端看到 EOF。
+    // 必须立刻 flush：请求只排队不会自动发出，compositor 收不到就不会
+    // 往管道写数据。否则读端只会超时拿到空内容（真实 bug）。
+    if conn.flush().is_err() {
+        drop(owned);
+        return None;
+    }
+    // 请求已随 socket 消息发出（fd 已复制给对端），本地写端必须关闭，
+    // source 写完并关闭对端 fd 后读端才会看到 EOF。
     drop(owned);
     let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
     if flags >= 0 {
@@ -289,6 +305,14 @@ impl Dispatch<ExtDataControlManagerV1, ()> for WaylandState {
 }
 
 impl Dispatch<ExtDataControlDeviceV1, ()> for WaylandState {
+    // data_offer(opcode 0) 与 primary_selection(opcode 3) 是携带 new_id 的
+    // 事件，wayland-client 要求显式给出子对象的 user-data 构造器；缺失会
+    // 在收到第一条 selection 时 panic。这里为 offer 对象绑定 `()`。
+    event_created_child!(WaylandState, ExtDataControlDeviceV1, [
+        0 => (ExtDataControlOfferV1, ()),
+        3 => (ExtDataControlOfferV1, ()),
+    ]);
+
     fn event(
         state: &mut Self,
         _proxy: &ExtDataControlDeviceV1,
