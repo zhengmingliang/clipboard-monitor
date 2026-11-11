@@ -217,6 +217,12 @@ type FtsRow = (
 );
 
 impl Database {
+    /// 仅测试：用显式密钥打开（验证密钥不匹配路径），不经钥匙串。
+    #[cfg(test)]
+    pub fn open_with_key_for_test(path: &Path, key: crate::crypto::DbKey) -> Result<Self> {
+        Self::open_inner(path, Some(key))
+    }
+
     /// 明文打开，仅用于单元测试。生产代码必须用 [`Database::open_encrypted`]。
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_inner(path, None)
@@ -1915,14 +1921,12 @@ mod tests {
         let cap = sample_cap("top-secret-value");
         let (_, eid) = db.insert_change(&cap, &sample_event(&cap), 1000).unwrap();
         drop(db);
-        // 换掉密钥文件，模拟密钥丢失/不匹配。
-        std::fs::write(
-            dir.join("master.key"),
-            format!("key:v1:{}", "00".repeat(32)),
-        )
-        .unwrap();
+        // 用一把不同的密钥直接打开同一数据库（不经钥匙串），
+        // 保证 Windows DPAPI / macOS Keychain / Linux 密钥文件三条路径
+        // 都走同一条解密失败判定。
+        let wrong_key = crate::crypto::DbKey::from_bytes_for_test([0u8; 32]);
         // 密钥不匹配时打开就应失败（迁移阶段解密失败），避免静默丢数据。
-        let result = Database::open_encrypted(&dir.join("monitor.db"));
+        let result = Database::open_with_key_for_test(&dir.join("monitor.db"), wrong_key);
         assert!(
             result.is_err(),
             "密钥不匹配时应明确报错而不是静默继续: {eid}"

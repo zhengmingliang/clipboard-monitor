@@ -43,6 +43,13 @@ fn keychain_account(dir: &Path) -> String {
 pub struct DbKey(Zeroizing<[u8; KEY_LEN]>);
 
 impl DbKey {
+    /// 仅测试：用固定字节构造密钥，用于验证"密钥不匹配"路径，
+    /// 绕开钥匙串/密钥文件，保证三平台行为一致。
+    #[cfg(test)]
+    pub fn from_bytes_for_test(key: [u8; KEY_LEN]) -> Self {
+        Self(Zeroizing::new(key))
+    }
+
     /// 从数据目录加载或创建密钥。
     ///
     /// 首次运行生成随机密钥并写入钥匙串（失败则回落密钥文件）。已有密钥
