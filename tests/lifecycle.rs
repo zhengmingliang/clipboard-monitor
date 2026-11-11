@@ -73,20 +73,18 @@ fn start_stop_graceful_shutdown_checkpoints_wal() {
     let port = free_port();
     let listen = format!("127.0.0.1:{port}");
 
+    // 注意：start 在 Windows 上用 DETACHED_PROCESS 拉起后台 serve，
+    // 若这里用 piped stdout，后台进程会继承管道句柄导致 output() 永不返回。
+    // 用 null stdio + status()，输出由后台进程自己的 monitor.log 承载。
     let start = Command::new(exe)
         .args(["start", "--data-dir"])
         .arg(&dir)
         .args(["--listen", &listen])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
         .expect("run start");
-    assert!(
-        start.status.success(),
-        "start 失败: stdout={} stderr={}",
-        String::from_utf8_lossy(&start.stdout),
-        String::from_utf8_lossy(&start.stderr)
-    );
+    assert!(start.success(), "start 命令失败");
 
     // 等后台进程写出 pid 与监听地址，并通过 HTTP 确认已就绪。
     assert!(
@@ -117,19 +115,30 @@ fn start_stop_graceful_shutdown_checkpoints_wal() {
         "停止前 WAL 应有未 checkpoint 的页（实际 {wal_before_len} 字节），否则无法验证 checkpoint"
     );
 
-    let stop = Command::new(exe)
+    // stop 也可能因为句柄继承等问题卡住，用带超时的线程等待，避免拖死 CI。
+    let stop_child = Command::new(exe)
         .args(["stop", "--data-dir"])
         .arg(&dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .expect("run stop");
+        .spawn()
+        .expect("spawn stop");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let out = stop_child.wait_with_output();
+        let _ = tx.send(out);
+    });
+    let output = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("stop 命令 20 秒内未返回（可能句柄继承导致管道不关闭）")
+        .expect("stop wait_with_output 失败");
+    let _ = waiter.join();
     let stop_out = format!(
         "{}{}",
-        String::from_utf8_lossy(&stop.stdout),
-        String::from_utf8_lossy(&stop.stderr)
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stop.status.success(), "stop 失败: {stop_out}");
+    assert!(output.status.success(), "stop 失败: {stop_out}");
     assert!(
         stop_out.contains("GRACEFUL_STOP=1"),
         "必须走优雅退出（Windows 命名事件 / Unix SIGTERM），实际输出: {stop_out}"
